@@ -1,0 +1,6 @@
+/emb
+*.o
+*.so
+*.a
+*.exe
+*.tmp
