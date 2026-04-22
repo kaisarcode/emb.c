@@ -180,6 +180,19 @@ static FILE *kc_fmemopen(const void *buf, size_t size, const char *mode) {
 }
 
 /**
+ * Null log callback to silence GGML diagnostics.
+ * @param level Log level.
+ * @param text Log text.
+ * @param user_data User data pointer.
+ * @return None.
+ */
+static void kc_ggml_log_callback(enum ggml_log_level level, const char *text, void *user_data) {
+    (void)level;
+    (void)text;
+    (void)user_data;
+}
+
+/**
  * Search for a token ID in the vocabulary.
  * @param ctx Context pointer.
  * @param str Token string.
@@ -236,7 +249,7 @@ kc_emb_t *kc_emb_open(void) {
     }
 
     struct gguf_init_params params = {
-        .no_alloc = false,
+        .no_alloc = true,
         .ctx = &ctx->ctx,
     };
 
@@ -245,6 +258,18 @@ kc_emb_t *kc_emb_open(void) {
 
     if (!ctx->gguf) {
         goto failure;
+    }
+
+    {
+        size_t data_offset = gguf_get_data_offset(ctx->gguf);
+        int n_tensors = gguf_get_n_tensors(ctx->gguf);
+        for (int i = 0; i < n_tensors; i++) {
+            const char *name = gguf_get_tensor_name(ctx->gguf, i);
+            struct ggml_tensor *t = ggml_get_tensor(ctx->ctx, name);
+            if (t) {
+                t->data = (char *)model_gguf + data_offset + gguf_get_tensor_offset(ctx->gguf, i);
+            }
+        }
     }
 
     ctx->n_embd = (int)get_kv_u32(ctx->gguf, "bert.embedding_length", 0);
@@ -276,23 +301,13 @@ kc_emb_t *kc_emb_open(void) {
     }
 
     for (int i = 0; i < ctx->n_vocab; i++) {
-        const char *token = gguf_get_arr_str(ctx->gguf, kid, i);
-        ctx->vocab[i] = token ? strdup(token) : NULL;
-        if (!ctx->vocab[i]) {
-            for (int j = 0; j < i; j++) free(ctx->vocab[j]);
-            free(ctx->vocab);
-            ctx->vocab = NULL;
-            goto failure;
-        }
+        ctx->vocab[i] = (char *)gguf_get_arr_str(ctx->gguf, kid, i);
     }
 
     if (build_vocab_hash(ctx) != 0) {
         if (ctx->vocab_hash) {
             free(ctx->vocab_hash);
             ctx->vocab_hash = NULL;
-        }
-        for (int i = 0; i < ctx->n_vocab; i++) {
-            if (ctx->vocab[i]) free(ctx->vocab[i]);
         }
         free(ctx->vocab);
         ctx->vocab = NULL;
@@ -394,61 +409,7 @@ kc_emb_t *kc_emb_open(void) {
         goto failure;
     }
 
-    {
-        struct ggml_init_params p = {
-            .mem_size   = ctx->compute_buf_size,
-            .mem_buffer = ctx->compute_buf,
-            .no_alloc   = true,
-        };
-        struct ggml_context *ctx0 = ggml_init(p);
-        if (ctx0) {
-            struct ggml_tensor *it = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
-            struct ggml_tensor *ip = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
-            struct ggml_tensor *ity = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
-            struct ggml_cgraph *gf = ggml_new_graph(ctx0);
-
-            struct ggml_tensor *cur = ggml_get_rows(ctx0, ctx->token_embd, it);
-            cur = ggml_add(ctx0, cur, ggml_get_rows(ctx0, ctx->pos_embd, ip));
-            cur = ggml_add(ctx0, cur, ggml_get_rows(ctx0, ctx->type_embd, ity));
-            cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->token_embd_norm_w), ctx->token_embd_norm_b);
-
-            int d_head = ctx->n_embd / ctx->n_head;
-            for (int il = 0; il < ctx->n_layer; il++) {
-                struct ggml_tensor *inp_L = cur;
-                struct ggml_tensor *q = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_q_w, cur), ctx->layers[il].attn_q_b);
-                struct ggml_tensor *k = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_k_w, cur), ctx->layers[il].attn_k_b);
-                struct ggml_tensor *v = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_v_w, cur), ctx->layers[il].attn_v_b);
-                q = ggml_reshape_3d(ctx0, q, d_head, ctx->n_head, ctx->n_ctx);
-                k = ggml_reshape_3d(ctx0, k, d_head, ctx->n_head, ctx->n_ctx);
-                v = ggml_reshape_3d(ctx0, v, d_head, ctx->n_head, ctx->n_ctx);
-                q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
-                k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
-                v = ggml_cont(ctx0, ggml_permute(ctx0, v, 1, 2, 0, 3));
-                struct ggml_tensor *kq = ggml_mul_mat(ctx0, q, k);
-                kq = ggml_scale_inplace(ctx0, kq, 1.0f / sqrtf((float)d_head));
-                kq = ggml_soft_max_inplace(ctx0, kq);
-                struct ggml_tensor *kqv = ggml_mul_mat(ctx0, v, kq);
-                kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
-                kqv = ggml_reshape_2d(ctx0, kqv, ctx->n_embd, ctx->n_ctx);
-                struct ggml_tensor *attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_out_w, kqv), ctx->layers[il].attn_out_b);
-                cur = ggml_add(ctx0, inp_L, attn_out);
-                cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].attn_norm_w), ctx->layers[il].attn_norm_b);
-                struct ggml_tensor *ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].ffn_up_w, cur), ctx->layers[il].ffn_up_b);
-                ffn = ggml_gelu(ctx0, ffn);
-                ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].ffn_down_w, ffn), ctx->layers[il].ffn_down_b);
-                cur = ggml_add(ctx0, cur, ffn);
-                cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].layer_norm_w), ctx->layers[il].layer_norm_b);
-            }
-            struct ggml_tensor *cls = ggml_view_2d(ctx0, cur, ctx->n_embd, 1, cur->nb[1], 0);
-            cls = ggml_cont(ctx0, cls);
-            ggml_build_forward_expand(gf, cls);
-            ggml_gallocr_reserve(ctx->galloc, gf);
-            ggml_free(ctx0);
-        }
-    }
+    ggml_log_set(kc_ggml_log_callback, NULL);
 
     return ctx;
 
@@ -468,12 +429,6 @@ void kc_emb_close(kc_emb_t *ctx) {
     }
 
     if (ctx->vocab) {
-        for (int i = 0; i < ctx->n_vocab; i++) {
-            if (ctx->vocab[i]) {
-                free(ctx->vocab[i]);
-                ctx->vocab[i] = NULL;
-            }
-        }
         free(ctx->vocab);
         ctx->vocab = NULL;
     }
