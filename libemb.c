@@ -86,6 +86,11 @@ struct kc_emb {
     } layers[MAX_LAYERS];
 };
 
+/**
+ * Generate a hash for a given string.
+ * @param str The string to hash.
+ * @return The hash value.
+ */
 static uint32_t hash_str(const char *str) {
     uint32_t h = 5381;
     int c;
@@ -93,6 +98,11 @@ static uint32_t hash_str(const char *str) {
     return h;
 }
 
+/**
+ * Initialize the vocabulary hash table.
+ * @param ctx The library context.
+ * @return None.
+ */
 static void build_vocab_hash(kc_emb_t *ctx) {
     ctx->vocab_hash_size = ctx->n_vocab * 2 + 1;
     ctx->vocab_hash = (hash_entry *)calloc(ctx->vocab_hash_size, sizeof(hash_entry));
@@ -106,6 +116,12 @@ static void build_vocab_hash(kc_emb_t *ctx) {
     }
 }
 
+/**
+ * Search for a token ID in the vocabulary.
+ * @param ctx The library context.
+ * @param str The string to search.
+ * @return The token ID or -1 if not found.
+ */
 static int find_token(kc_emb_t *ctx, const char *str) {
     uint32_t h = hash_str(str) % ctx->vocab_hash_size;
     while (ctx->vocab_hash[h].str != NULL) {
@@ -117,6 +133,10 @@ static int find_token(kc_emb_t *ctx, const char *str) {
     return -1;
 }
 
+/**
+ * Initialize a new embedding context.
+ * @return Context pointer or NULL on failure.
+ */
 kc_emb_t *kc_emb_open(void) {
     kc_emb_t *ctx = (kc_emb_t *)calloc(1, sizeof(kc_emb_t));
     if (!ctx) return NULL;
@@ -266,6 +286,11 @@ kc_emb_t *kc_emb_open(void) {
     return ctx;
 }
 
+/**
+ * Release an embedding context.
+ * @param ctx Context pointer.
+ * @return None.
+ */
 void kc_emb_close(kc_emb_t *ctx) {
     if (!ctx) return;
     if (ctx->vocab) {
@@ -280,6 +305,14 @@ void kc_emb_close(kc_emb_t *ctx) {
     free(ctx);
 }
 
+/**
+ * Split input text into WordPiece tokens.
+ * @param ctx The library context.
+ * @param input The text to tokenize.
+ * @param tokens Output array for token IDs.
+ * @param n_tokens Output pointer for the number of tokens.
+ * @return None.
+ */
 static void wordpiece_tokenize(kc_emb_t *ctx, const char *input, int *tokens, int *n_tokens) {
     *n_tokens = 0;
     tokens[(*n_tokens)++] = ctx->cls_token_id;
@@ -355,6 +388,12 @@ static void wordpiece_tokenize(kc_emb_t *ctx, const char *input, int *tokens, in
     }
 }
 
+/**
+ * Generate embeddings for the given input text.
+ * @param ctx The library context.
+ * @param input The text to process.
+ * @return KC_EMB_OK on success, KC_EMB_ERROR on failure.
+ */
 int kc_emb_exec(kc_emb_t *ctx, const char *input) {
     if (!ctx || !input) return KC_EMB_ERROR;
 

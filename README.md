@@ -86,8 +86,10 @@ xxd -i your_model.gguf > model.c
 
 **Author:** KaisarCode
 
-**Website:** [https://kaisarcode.com](https://kaisarcode.com)
+**Email:** [kaisar@kaisarcode.com](mailto:kaisar@kaisarcode.com)
 
-**License:** [GNU GPL v3.0](https://www.gnu.org/licenses/gpl-3.0.html)
+**Website:** https://kaisarcode.com
+
+**License:** https://www.gnu.org/licenses/gpl-3.0.html
 
 © 2026 KaisarCode
