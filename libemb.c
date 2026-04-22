@@ -93,6 +93,18 @@ struct kc_emb {
     float *out;
 };
 
+static int kc_isspace(int c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static int kc_ispunct(int c) {
+    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+}
+
+static int kc_tolower(int c) {
+    return (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+}
+
 /**
  * Generate a hash for a given string.
  * @param str Input string.
@@ -101,21 +113,21 @@ struct kc_emb {
 static uint32_t hash_str(const char *str) {
     uint32_t h = 5381;
     int c;
-    while ((c = *str++)) h = ((h << 5) + h) + c;
+    while ((c = *str++)) h = ((h << 5) + h) + (uint8_t)c;
     return h;
 }
 
 /**
  * Initialize the vocabulary hash table.
  * @param ctx Context pointer.
- * @return None.
+ * @return 0 on success, -1 on failure.
  */
-static void build_vocab_hash(kc_emb_t *ctx) {
+static int build_vocab_hash(kc_emb_t *ctx) {
     ctx->vocab_hash_size = ctx->n_vocab * 2 + 1;
     ctx->vocab_hash = (hash_entry *)calloc(ctx->vocab_hash_size, sizeof(hash_entry));
 
     if (!ctx->vocab_hash) {
-        return;
+        return -1;
     }
 
     for (int i = 0; i < ctx->n_vocab; i++) {
@@ -126,6 +138,7 @@ static void build_vocab_hash(kc_emb_t *ctx) {
         ctx->vocab_hash[h].str = ctx->vocab[i];
         ctx->vocab_hash[h].id = i;
     }
+    return 0;
 }
 
 /**
@@ -227,8 +240,13 @@ kc_emb_t *kc_emb_open(void) {
     for (int i = 0; i < ctx->n_vocab; i++) {
         ctx->vocab[i] = strdup(gguf_get_arr_str(ctx->gguf, kid, i));
     }
-    build_vocab_hash(ctx);
-    if (!ctx->vocab_hash) {
+
+    if (build_vocab_hash(ctx) != 0) {
+        for (int i = 0; i < ctx->n_vocab; i++) {
+            if (ctx->vocab[i]) free(ctx->vocab[i]);
+        }
+        free(ctx->vocab);
+        ctx->vocab = NULL;
         goto failure;
     }
 
@@ -420,11 +438,11 @@ static void wordpiece_tokenize(
      * Tokens exceeding this length will be truncated to prevent overflows.
      */
     while (i < len && *n_tokens < ctx->n_ctx - 1) {
-        while (i < len && isspace(input[i])) i++;
+        while (i < len && kc_isspace((uint8_t)input[i])) i++;
         if (i >= len) break;
 
-        if (ispunct(input[i])) {
-            char p[2] = { (char)tolower(input[i]), '\0' };
+        if (kc_ispunct((uint8_t)input[i])) {
+            char p[2] = { (char)kc_tolower((uint8_t)input[i]), '\0' };
             int id = find_token(ctx, p);
             tokens[(*n_tokens)++] = id >= 0 ? id : ctx->unk_token_id;
             i++;
@@ -432,7 +450,7 @@ static void wordpiece_tokenize(
         }
 
         int j = i;
-        while (j < len && !isspace(input[j]) && !ispunct(input[j])) j++;
+        while (j < len && !kc_isspace((uint8_t)input[j]) && !kc_ispunct((uint8_t)input[j])) j++;
 
         int word_len = j - i;
         char word[128];
@@ -440,7 +458,7 @@ static void wordpiece_tokenize(
         if (word_len >= (int)sizeof(word)) word_len = sizeof(word) - 1;
 
         for (int k = 0; k < word_len; k++) {
-            word[k] = tolower(input[i + k]);
+            word[k] = (char)kc_tolower((uint8_t)input[i + k]);
         }
         word[word_len] = '\0';
 
@@ -515,13 +533,26 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
     struct ggml_tensor *pos = NULL;
     struct ggml_tensor *typ = NULL;
     int d_head = 0;
+    const char *prefix = "Represent this sentence for retrieval: ";
+    char *norm_input = NULL;
+    size_t norm_len = 0;
 
     if (!ctx || !input) return NULL;
 
-    tokens = (int *)malloc(ctx->n_ctx * sizeof(int));
-    if (!tokens) return NULL;
+    norm_len = strlen(prefix) + strlen(input) + 1;
+    norm_input = (char *)malloc(norm_len);
+    if (!norm_input) return NULL;
 
-    wordpiece_tokenize(ctx, input, tokens, &n_tokens);
+    snprintf(norm_input, norm_len, "%s%s", prefix, input);
+
+    tokens = (int *)calloc(ctx->n_ctx, sizeof(int));
+    if (!tokens) {
+        free(norm_input);
+        return NULL;
+    }
+
+    wordpiece_tokenize(ctx, norm_input, tokens, &n_tokens);
+    free(norm_input);
 
     if (n_tokens < 2 || n_tokens > ctx->n_ctx) {
         free(tokens);
@@ -530,7 +561,7 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
 
     params.mem_size   = ctx->compute_buf_size;
     params.mem_buffer = ctx->compute_buf;
-    params.no_alloc   = false;
+    params.no_alloc   = true;
 
     ctx0 = ggml_init(params);
     if (!ctx0) {
@@ -545,11 +576,6 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
     if (!inp_tokens || !inp_pos || !inp_type) {
         goto failure;
     }
-
-    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
-    pos_data = (int *)inp_pos->data;
-    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
-    memset(inp_type->data, 0, n_tokens * sizeof(int));
 
     gf = ggml_new_graph(ctx0);
     if (!gf) {
@@ -617,13 +643,23 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         goto failure;
     }
 
+    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
+    pos_data = (int *)inp_pos->data;
+    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
+    memset(inp_type->data, 0, n_tokens * sizeof(int));
+
     ggml_backend_graph_compute(ctx->backend, gf);
 
-    if (cur->ne[0] != ctx->n_embd) {
+    if (!cur->data || cur->ne[0] != ctx->n_embd) {
         goto failure;
     }
 
-    memcpy(ctx->out, cur->data, ctx->n_embd * sizeof(float));
+    {
+        uint8_t *data = (uint8_t *)cur->data;
+        for (int j = 0; j < ctx->n_embd; j++) {
+            ctx->out[j] = *(float *)(data + j * cur->nb[0]);
+        }
+    }
 
     ggml_free(ctx0);
     free(tokens);
