@@ -628,7 +628,8 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         goto failure;
     }
 
-    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
+    for (int i = n_tokens; i < ctx->n_ctx; i++) tokens[i] = ctx->pad_token_id;
+    for (int i = 0; i < ctx->n_ctx; i++) pos_data[i] = i;
 
     params.mem_size   = ctx->compute_buf_size;
     params.mem_buffer = ctx->compute_buf;
@@ -639,9 +640,9 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         goto failure;
     }
 
-    inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    inp_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    inp_type   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
+    inp_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
+    inp_type   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
 
     if (!inp_tokens || !inp_pos || !inp_type) {
         goto failure;
@@ -674,9 +675,9 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         struct ggml_tensor *k = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_k_w, cur), ctx->layers[il].attn_k_b);
         struct ggml_tensor *v = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_v_w, cur), ctx->layers[il].attn_v_b);
 
-        q = ggml_reshape_3d(ctx0, q, d_head, ctx->n_head, n_tokens);
-        k = ggml_reshape_3d(ctx0, k, d_head, ctx->n_head, n_tokens);
-        v = ggml_reshape_3d(ctx0, v, d_head, ctx->n_head, n_tokens);
+        q = ggml_reshape_3d(ctx0, q, d_head, ctx->n_head, ctx->n_ctx);
+        k = ggml_reshape_3d(ctx0, k, d_head, ctx->n_head, ctx->n_ctx);
+        v = ggml_reshape_3d(ctx0, v, d_head, ctx->n_head, ctx->n_ctx);
 
         q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
         k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
@@ -688,7 +689,7 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
 
         struct ggml_tensor *kqv = ggml_mul_mat(ctx0, v, kq);
         kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
-        kqv = ggml_reshape_2d(ctx0, kqv, ctx->n_embd, n_tokens);
+        kqv = ggml_reshape_2d(ctx0, kqv, ctx->n_embd, ctx->n_ctx);
 
         struct ggml_tensor *attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_out_w, kqv), ctx->layers[il].attn_out_b);
 
@@ -719,9 +720,9 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         goto failure;
     }
 
-    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
-    memcpy(inp_pos->data, pos_data, n_tokens * sizeof(int));
-    memset(inp_type->data, 0, n_tokens * sizeof(int));
+    memcpy(inp_tokens->data, tokens, ctx->n_ctx * sizeof(int));
+    memcpy(inp_pos->data, pos_data, ctx->n_ctx * sizeof(int));
+    memset(inp_type->data, 0, ctx->n_ctx * sizeof(int));
 
     ggml_backend_graph_compute(ctx->backend, gf);
 
