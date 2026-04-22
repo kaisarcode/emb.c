@@ -30,9 +30,6 @@
 #include <windows.h>
 #endif
 
-#define MAX_LAYERS 32
-#define MAX_TOKENS 512
-
 extern unsigned char model_gguf[];
 extern unsigned int model_gguf_len;
 
@@ -40,6 +37,25 @@ typedef struct {
     char *str;
     int id;
 } hash_entry;
+
+struct kc_emb_layer {
+    struct ggml_tensor *attn_q_w;
+    struct ggml_tensor *attn_q_b;
+    struct ggml_tensor *attn_k_w;
+    struct ggml_tensor *attn_k_b;
+    struct ggml_tensor *attn_v_w;
+    struct ggml_tensor *attn_v_b;
+    struct ggml_tensor *attn_out_w;
+    struct ggml_tensor *attn_out_b;
+    struct ggml_tensor *attn_norm_w;
+    struct ggml_tensor *attn_norm_b;
+    struct ggml_tensor *ffn_up_w;
+    struct ggml_tensor *ffn_up_b;
+    struct ggml_tensor *ffn_down_w;
+    struct ggml_tensor *ffn_down_b;
+    struct ggml_tensor *layer_norm_w;
+    struct ggml_tensor *layer_norm_b;
+};
 
 struct kc_emb {
     struct ggml_context *ctx;
@@ -49,6 +65,7 @@ struct kc_emb {
     int n_embd;
     int n_layer;
     int n_head;
+    int n_ctx;
     float layer_norm_eps;
 
     int cls_token_id;
@@ -66,24 +83,12 @@ struct kc_emb {
     struct ggml_tensor *token_embd_norm_w;
     struct ggml_tensor *token_embd_norm_b;
 
-    struct {
-        struct ggml_tensor *attn_q_w;
-        struct ggml_tensor *attn_q_b;
-        struct ggml_tensor *attn_k_w;
-        struct ggml_tensor *attn_k_b;
-        struct ggml_tensor *attn_v_w;
-        struct ggml_tensor *attn_v_b;
-        struct ggml_tensor *attn_out_w;
-        struct ggml_tensor *attn_out_b;
-        struct ggml_tensor *attn_norm_w;
-        struct ggml_tensor *attn_norm_b;
-        struct ggml_tensor *ffn_up_w;
-        struct ggml_tensor *ffn_up_b;
-        struct ggml_tensor *ffn_down_w;
-        struct ggml_tensor *ffn_down_b;
-        struct ggml_tensor *layer_norm_w;
-        struct ggml_tensor *layer_norm_b;
-    } layers[MAX_LAYERS];
+    struct kc_emb_layer *layers;
+
+    void *compute_buf;
+    size_t compute_buf_size;
+    ggml_backend_t backend;
+    ggml_gallocr_t galloc;
 };
 
 /**
@@ -107,6 +112,10 @@ static void build_vocab_hash(kc_emb_t *ctx) {
     ctx->vocab_hash_size = ctx->n_vocab * 2 + 1;
     ctx->vocab_hash = (hash_entry *)calloc(ctx->vocab_hash_size, sizeof(hash_entry));
 
+    if (!ctx->vocab_hash) {
+        return;
+    }
+
     for (int i = 0; i < ctx->n_vocab; i++) {
         uint32_t h = hash_str(ctx->vocab[i]) % ctx->vocab_hash_size;
         while (ctx->vocab_hash[h].str != NULL) {
@@ -124,6 +133,10 @@ static void build_vocab_hash(kc_emb_t *ctx) {
  * @return Token ID or -1 if not found.
  */
 static int find_token(kc_emb_t *ctx, const char *str) {
+    if (!ctx->vocab_hash || ctx->vocab_hash_size == 0) {
+        return -1;
+    }
+
     uint32_t h = hash_str(str) % ctx->vocab_hash_size;
     while (ctx->vocab_hash[h].str != NULL) {
         if (strcmp(ctx->vocab_hash[h].str, str) == 0) {
@@ -178,26 +191,43 @@ kc_emb_t *kc_emb_open(void) {
     fclose(f);
 
     if (!ctx->gguf) {
-        free(ctx);
-        return NULL;
+        goto failure;
     }
 
     ctx->n_embd = (int)get_kv_u32(ctx->gguf, "bert.embedding_length", 0);
     ctx->n_layer = (int)get_kv_u32(ctx->gguf, "bert.block_count", 0);
     ctx->n_head = (int)get_kv_u32(ctx->gguf, "bert.attention.head_count", 0);
+    ctx->n_ctx = (int)get_kv_u32(ctx->gguf, "bert.context_length", 512);
+
+    if (ctx->n_embd <= 0 || ctx->n_layer <= 0 || ctx->n_head <= 0 || ctx->n_ctx <= 0 || (ctx->n_embd % ctx->n_head) != 0) {
+        goto failure;
+    }
 
     int64_t kid;
     kid = gguf_find_key(ctx->gguf, "bert.attention.layer_norm_epsilon");
     ctx->layer_norm_eps = (kid >= 0) ? gguf_get_val_f32(ctx->gguf, kid) : 1e-12f;
 
     kid = gguf_find_key(ctx->gguf, "tokenizer.ggml.tokens");
-    if (kid >= 0) {
-        ctx->n_vocab = (int)gguf_get_arr_n(ctx->gguf, kid);
-        ctx->vocab = (char **)malloc(ctx->n_vocab * sizeof(char *));
-        for (int i = 0; i < ctx->n_vocab; i++) {
-            ctx->vocab[i] = strdup(gguf_get_arr_str(ctx->gguf, kid, i));
-        }
-        build_vocab_hash(ctx);
+    if (kid < 0) {
+        goto failure;
+    }
+
+    ctx->n_vocab = (int)gguf_get_arr_n(ctx->gguf, kid);
+    if (ctx->n_vocab <= 0) {
+        goto failure;
+    }
+
+    ctx->vocab = (char **)malloc(ctx->n_vocab * sizeof(char *));
+    if (!ctx->vocab) {
+        goto failure;
+    }
+
+    for (int i = 0; i < ctx->n_vocab; i++) {
+        ctx->vocab[i] = strdup(gguf_get_arr_str(ctx->gguf, kid, i));
+    }
+    build_vocab_hash(ctx);
+    if (!ctx->vocab_hash) {
+        goto failure;
     }
 
     ctx->cls_token_id = (int)get_kv_u32(ctx->gguf, "tokenizer.ggml.cls_token_id", 101);
@@ -211,50 +241,90 @@ kc_emb_t *kc_emb_open(void) {
     ctx->token_embd_norm_w = ggml_get_tensor(ctx->ctx, "token_embd_norm.weight");
     ctx->token_embd_norm_b = ggml_get_tensor(ctx->ctx, "token_embd_norm.bias");
 
-    for (int i = 0; i < ctx->n_layer && i < MAX_LAYERS; i++) {
+    if (!ctx->token_embd || !ctx->pos_embd || !ctx->type_embd || !ctx->token_embd_norm_w || !ctx->token_embd_norm_b) {
+        goto failure;
+    }
+
+    ctx->layers = (struct kc_emb_layer *)calloc(ctx->n_layer, sizeof(struct kc_emb_layer));
+    if (!ctx->layers) {
+        goto failure;
+    }
+
+    for (int i = 0; i < ctx->n_layer; i++) {
         char name[64];
-        sprintf(name, "blk.%d.attn_q.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
         ctx->layers[i].attn_q_w = ggml_get_tensor(ctx->ctx, name);
-        sprintf(name, "blk.%d.attn_q.bias", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", i);
         ctx->layers[i].attn_q_b = ggml_get_tensor(ctx->ctx, name);
 
-        sprintf(name, "blk.%d.attn_k.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
         ctx->layers[i].attn_k_w = ggml_get_tensor(ctx->ctx, name);
-        sprintf(name, "blk.%d.attn_k.bias", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", i);
         ctx->layers[i].attn_k_b = ggml_get_tensor(ctx->ctx, name);
 
-        sprintf(name, "blk.%d.attn_v.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);
         ctx->layers[i].attn_v_w = ggml_get_tensor(ctx->ctx, name);
-        sprintf(name, "blk.%d.attn_v.bias", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", i);
         ctx->layers[i].attn_v_b = ggml_get_tensor(ctx->ctx, name);
 
-        sprintf(name, "blk.%d.attn_output.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", i);
         ctx->layers[i].attn_out_w = ggml_get_tensor(ctx->ctx, name);
-        sprintf(name, "blk.%d.attn_output.bias", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_output.bias", i);
         ctx->layers[i].attn_out_b = ggml_get_tensor(ctx->ctx, name);
 
-        sprintf(name, "blk.%d.attn_output_norm.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_output_norm.weight", i);
         ctx->layers[i].attn_norm_w = ggml_get_tensor(ctx->ctx, name);
-        sprintf(name, "blk.%d.attn_output_norm.bias", i);
+        snprintf(name, sizeof(name), "blk.%d.attn_output_norm.bias", i);
         ctx->layers[i].attn_norm_b = ggml_get_tensor(ctx->ctx, name);
 
-        sprintf(name, "blk.%d.ffn_up.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", i);
         ctx->layers[i].ffn_up_w = ggml_get_tensor(ctx->ctx, name);
-        sprintf(name, "blk.%d.ffn_up.bias", i);
+        snprintf(name, sizeof(name), "blk.%d.ffn_up.bias", i);
         ctx->layers[i].ffn_up_b = ggml_get_tensor(ctx->ctx, name);
 
-        sprintf(name, "blk.%d.ffn_down.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", i);
         ctx->layers[i].ffn_down_w = ggml_get_tensor(ctx->ctx, name);
-        sprintf(name, "blk.%d.ffn_down.bias", i);
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.bias", i);
         ctx->layers[i].ffn_down_b = ggml_get_tensor(ctx->ctx, name);
 
-        sprintf(name, "blk.%d.layer_output_norm.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.layer_output_norm.weight", i);
         ctx->layers[i].layer_norm_w = ggml_get_tensor(ctx->ctx, name);
-        sprintf(name, "blk.%d.layer_output_norm.bias", i);
+        snprintf(name, sizeof(name), "blk.%d.layer_output_norm.bias", i);
         ctx->layers[i].layer_norm_b = ggml_get_tensor(ctx->ctx, name);
+
+        if (!ctx->layers[i].attn_q_w || !ctx->layers[i].attn_q_b ||
+            !ctx->layers[i].attn_k_w || !ctx->layers[i].attn_k_b ||
+            !ctx->layers[i].attn_v_w || !ctx->layers[i].attn_v_b ||
+            !ctx->layers[i].attn_out_w || !ctx->layers[i].attn_out_b ||
+            !ctx->layers[i].attn_norm_w || !ctx->layers[i].attn_norm_b ||
+            !ctx->layers[i].ffn_up_w || !ctx->layers[i].ffn_up_b ||
+            !ctx->layers[i].ffn_down_w || !ctx->layers[i].ffn_down_b ||
+            !ctx->layers[i].layer_norm_w || !ctx->layers[i].layer_norm_b) {
+            goto failure;
+        }
+    }
+
+    ctx->compute_buf_size = 64 * 1024 * 1024;
+    ctx->compute_buf = malloc(ctx->compute_buf_size);
+    if (!ctx->compute_buf) {
+        goto failure;
+    }
+
+    ctx->backend = ggml_backend_cpu_init();
+    if (!ctx->backend) {
+        goto failure;
+    }
+
+    ctx->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ctx->galloc) {
+        goto failure;
     }
 
     return ctx;
+
+failure:
+    kc_emb_close(ctx);
+    return NULL;
 }
 
 /**
@@ -276,6 +346,22 @@ void kc_emb_close(kc_emb_t *ctx) {
 
     if (ctx->vocab_hash) {
         free(ctx->vocab_hash);
+    }
+
+    if (ctx->layers) {
+        free(ctx->layers);
+    }
+
+    if (ctx->compute_buf) {
+        free(ctx->compute_buf);
+    }
+
+    if (ctx->galloc) {
+        ggml_gallocr_free(ctx->galloc);
+    }
+
+    if (ctx->backend) {
+        ggml_backend_free(ctx->backend);
     }
 
     if (ctx->gguf) {
@@ -309,7 +395,11 @@ static void wordpiece_tokenize(
     int len = strlen(input);
     int i = 0;
 
-    while (i < len && *n_tokens < MAX_TOKENS - 1) {
+    /**
+     * Note: This tokenizer uses fixed 128-byte buffers for words and subwords.
+     * Tokens exceeding this length will be truncated to prevent overflows.
+     */
+    while (i < len && *n_tokens < ctx->n_ctx - 1) {
         while (i < len && isspace(input[i])) i++;
         if (i >= len) break;
 
@@ -336,7 +426,7 @@ static void wordpiece_tokenize(
 
         int start = 0;
 
-        while (start < word_len && *n_tokens < MAX_TOKENS - 1) {
+        while (start < word_len && *n_tokens < ctx->n_ctx - 1) {
             int end = word_len;
             int best_id = -1;
             int best_end = -1;
@@ -380,7 +470,7 @@ static void wordpiece_tokenize(
         i = j;
     }
 
-    if (*n_tokens < MAX_TOKENS) {
+    if (*n_tokens < ctx->n_ctx) {
         tokens[(*n_tokens)++] = ctx->sep_token_id;
     }
 }
@@ -394,61 +484,69 @@ static void wordpiece_tokenize(
 int kc_emb_exec(kc_emb_t *ctx, const char *input) {
     if (!ctx || !input) return KC_EMB_ERROR;
 
-    int tokens[MAX_TOKENS];
-    int n_tokens;
+    int *tokens = (int *)malloc(ctx->n_ctx * sizeof(int));
+    if (!tokens) return KC_EMB_ERROR;
+
+    int n_tokens = 0;
     wordpiece_tokenize(ctx, input, tokens, &n_tokens);
 
-    size_t buf_size = 1024 * 1024 * 64;
-    void *buf = malloc(buf_size);
-    if (!buf) return KC_EMB_ERROR;
+    if (n_tokens <= 0 || n_tokens > ctx->n_ctx) {
+        free(tokens);
+        return KC_EMB_ERROR;
+    }
 
     struct ggml_init_params params = {
-        .mem_size   = buf_size,
-        .mem_buffer = buf,
-        .no_alloc   = false,
+        .mem_size   = ctx->compute_buf_size,
+        .mem_buffer = ctx->compute_buf,
+        .no_alloc   = true,
     };
 
     struct ggml_context *ctx0 = ggml_init(params);
+    if (!ctx0) {
+        free(tokens);
+        return KC_EMB_ERROR;
+    }
+
     struct ggml_cgraph *gf = ggml_new_graph(ctx0);
+    if (!gf) {
+        ggml_free(ctx0);
+        free(tokens);
+        return KC_EMB_ERROR;
+    }
 
     struct ggml_tensor *inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
-
     struct ggml_tensor *inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    int *pos_data = (int *)inp_pos->data;
-    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
-
     struct ggml_tensor *inp_type = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    memset(inp_type->data, 0, n_tokens * sizeof(int));
+
+    if (!inp_tokens || !inp_pos || !inp_type) {
+        ggml_free(ctx0);
+        free(tokens);
+        return KC_EMB_ERROR;
+    }
 
     struct ggml_tensor *cur = ggml_get_rows(ctx0, ctx->token_embd, inp_tokens);
     struct ggml_tensor *pos = ggml_get_rows(ctx0, ctx->pos_embd, inp_pos);
     struct ggml_tensor *typ = ggml_get_rows(ctx0, ctx->type_embd, inp_type);
 
+    if (!cur || !pos || !typ) {
+        ggml_free(ctx0);
+        free(tokens);
+        return KC_EMB_ERROR;
+    }
+
     cur = ggml_add(ctx0, cur, pos);
     cur = ggml_add(ctx0, cur, typ);
-
     cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-    cur = ggml_add(ctx0,
-        ggml_mul(ctx0, cur, ctx->token_embd_norm_w),
-        ctx->token_embd_norm_b);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->token_embd_norm_w), ctx->token_embd_norm_b);
 
     int d_head = ctx->n_embd / ctx->n_head;
 
     for (int il = 0; il < ctx->n_layer; il++) {
         struct ggml_tensor *inp_L = cur;
 
-        struct ggml_tensor *q = ggml_add(ctx0,
-            ggml_mul_mat(ctx0, ctx->layers[il].attn_q_w, cur),
-            ctx->layers[il].attn_q_b);
-
-        struct ggml_tensor *k = ggml_add(ctx0,
-            ggml_mul_mat(ctx0, ctx->layers[il].attn_k_w, cur),
-            ctx->layers[il].attn_k_b);
-
-        struct ggml_tensor *v = ggml_add(ctx0,
-            ggml_mul_mat(ctx0, ctx->layers[il].attn_v_w, cur),
-            ctx->layers[il].attn_v_b);
+        struct ggml_tensor *q = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_q_w, cur), ctx->layers[il].attn_q_b);
+        struct ggml_tensor *k = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_k_w, cur), ctx->layers[il].attn_k_b);
+        struct ggml_tensor *v = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_v_w, cur), ctx->layers[il].attn_v_b);
 
         q = ggml_reshape_3d(ctx0, q, d_head, ctx->n_head, n_tokens);
         k = ggml_reshape_3d(ctx0, k, d_head, ctx->n_head, n_tokens);
@@ -466,57 +564,50 @@ int kc_emb_exec(kc_emb_t *ctx, const char *input) {
         kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
         kqv = ggml_reshape_2d(ctx0, kqv, ctx->n_embd, n_tokens);
 
-        struct ggml_tensor *attn_out = ggml_add(ctx0,
-            ggml_mul_mat(ctx0, ctx->layers[il].attn_out_w, kqv),
-            ctx->layers[il].attn_out_b);
+        struct ggml_tensor *attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_out_w, kqv), ctx->layers[il].attn_out_b);
 
         cur = ggml_add(ctx0, inp_L, attn_out);
-
         cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-        cur = ggml_add(ctx0,
-            ggml_mul(ctx0, cur, ctx->layers[il].attn_norm_w),
-            ctx->layers[il].attn_norm_b);
+        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].attn_norm_w), ctx->layers[il].attn_norm_b);
 
         struct ggml_tensor *inp_F = cur;
-
-        struct ggml_tensor *ffn = ggml_add(ctx0,
-            ggml_mul_mat(ctx0, ctx->layers[il].ffn_up_w, cur),
-            ctx->layers[il].ffn_up_b);
-
+        struct ggml_tensor *ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].ffn_up_w, cur), ctx->layers[il].ffn_up_b);
         ffn = ggml_gelu(ctx0, ffn);
-
-        ffn = ggml_add(ctx0,
-            ggml_mul_mat(ctx0, ctx->layers[il].ffn_down_w, ffn),
-            ctx->layers[il].ffn_down_b);
+        ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].ffn_down_w, ffn), ctx->layers[il].ffn_down_b);
 
         cur = ggml_add(ctx0, inp_F, ffn);
-
         cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-        cur = ggml_add(ctx0,
-            ggml_mul(ctx0, cur, ctx->layers[il].layer_norm_w),
-            ctx->layers[il].layer_norm_b);
+        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].layer_norm_w), ctx->layers[il].layer_norm_b);
     }
 
     ggml_build_forward_expand(gf, cur);
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    ggml_gallocr_t galloc = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_alloc_graph(galloc, gf);
+    if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
+        ggml_free(ctx0);
+        free(tokens);
+        return KC_EMB_ERROR;
+    }
 
-    ggml_backend_graph_compute(backend, gf);
+    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
+    int *pos_data = (int *)inp_pos->data;
+    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
+    memset(inp_type->data, 0, n_tokens * sizeof(int));
 
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    /**
+     * Note: This implementation assumes CLS pooling (returning the first
+     * token's embedding). The output corresponds to the first row of
+     * the final context tensor.
+     */
     float *out_data = (float *)cur->data;
-
     for (int i = 0; i < ctx->n_embd; i++) {
         printf("%f%s", out_data[i], i == ctx->n_embd - 1 ? "" : " ");
     }
     printf("\n");
 
-    ggml_gallocr_free(galloc);
-    ggml_backend_free(backend);
     ggml_free(ctx0);
-    free(buf);
+    free(tokens);
 
     return KC_EMB_OK;
 }

@@ -32,9 +32,10 @@ static void kc_print_help(const char *name) {
  * @return Process status code.
  */
 int main(int argc, char **argv) {
-    kc_emb_t *ctx;
-    int rc;
+    kc_emb_t *ctx = NULL;
     char *input_text = NULL;
+    int allocated = 0;
+    int status = 0;
 
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         kc_print_help(argv[0]);
@@ -44,68 +45,94 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         size_t size = 1024;
         size_t len = 0;
+        const size_t max_size = 1048576;
+
         input_text = (char *)malloc(size);
         if (!input_text) {
             fprintf(stderr, "emb: out of memory\n");
             return 1;
         }
+        allocated = 1;
+
         int c;
         while ((c = getchar()) != EOF) {
             if (len + 1 >= size) {
+                if (size >= max_size) {
+                    fprintf(stderr, "emb: input too large\n");
+                    goto failure;
+                }
                 size *= 2;
                 char *new_buf = (char *)realloc(input_text, size);
                 if (!new_buf) {
-                    free(input_text);
                     fprintf(stderr, "emb: out of memory\n");
-                    return 1;
+                    goto failure;
                 }
                 input_text = new_buf;
             }
             input_text[len++] = (char)c;
         }
+
+        if (ferror(stdin)) {
+            fprintf(stderr, "emb: read error\n");
+            goto failure;
+        }
+
         input_text[len] = '\0';
 
         if (len == 0) {
             kc_print_help(argv[0]);
-            free(input_text);
-            return 1;
+            status = 1;
+            goto failure;
         }
     } else {
         size_t total = 0;
         for (int i = 1; i < argc; i++) {
-            total += strlen(argv[i]) + 1;
+            total += strlen(argv[i]);
         }
 
+        if (total == 0) {
+            kc_print_help(argv[0]);
+            return 1;
+        }
+
+        total += (argc - 2);
         input_text = (char *)malloc(total + 1);
         if (!input_text) {
             fprintf(stderr, "emb: out of memory\n");
             return 1;
         }
+        allocated = 1;
 
-        input_text[0] = '\0';
+        char *ptr = input_text;
         for (int i = 1; i < argc; i++) {
-            strcat(input_text, argv[i]);
-            if (i != argc - 1) strcat(input_text, " ");
+            size_t slen = strlen(argv[i]);
+            memcpy(ptr, argv[i], slen);
+            ptr += slen;
+            if (i != argc - 1) {
+                *ptr++ = ' ';
+            }
         }
+        *ptr = '\0';
     }
 
     ctx = kc_emb_open();
     if (!ctx) {
         fprintf(stderr, "emb: initialization failed\n");
-        if (argc >= 2) free(input_text);
-        return 1;
+        goto failure;
     }
 
-    rc = kc_emb_exec(ctx, input_text);
-
-    if (rc != KC_EMB_OK) {
+    if (kc_emb_exec(ctx, input_text) != KC_EMB_OK) {
         fprintf(stderr, "emb: execution failed\n");
-        kc_emb_close(ctx);
-        if (argc >= 2) free(input_text);
-        return 1;
+        goto failure;
     }
 
-    kc_emb_close(ctx);
-    if (argc >= 2) free(input_text);
-    return 0;
+    goto cleanup;
+
+failure:
+    status = 1;
+
+cleanup:
+    if (ctx) kc_emb_close(ctx);
+    if (allocated) free(input_text);
+    return status;
 }
