@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
@@ -93,14 +94,29 @@ struct kc_emb {
     float *out;
 };
 
+/**
+ * Check if a character is a space (ASCII only).
+ * @param c Input character.
+ * @return 1 if space, 0 otherwise.
+ */
 static int kc_isspace(int c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
 }
 
+/**
+ * Check if a character is punctuation (ASCII only).
+ * @param c Input character.
+ * @return 1 if punctuation, 0 otherwise.
+ */
 static int kc_ispunct(int c) {
     return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
 }
 
+/**
+ * Convert a character to lowercase (ASCII only).
+ * @param c Input character.
+ * @return Lowercase character.
+ */
 static int kc_tolower(int c) {
     return (c >= 'A' && c <= 'Z') ? (c + 32) : c;
 }
@@ -139,6 +155,28 @@ static int build_vocab_hash(kc_emb_t *ctx) {
         ctx->vocab_hash[h].id = i;
     }
     return 0;
+}
+
+/**
+ * Portable implementation of fmemopen for systems that lack it (e.g. Windows).
+ * @param buf Data buffer.
+ * @param size Buffer size.
+ * @param mode Open mode.
+ * @return FILE pointer or NULL on failure.
+ */
+static FILE *kc_fmemopen(const void *buf, size_t size, const char *mode) {
+#ifdef _WIN32
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    if (fwrite(buf, 1, size, f) != size) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    return f;
+#else
+    return fmemopen((void *)buf, size, mode);
+#endif
 }
 
 /**
@@ -191,7 +229,7 @@ kc_emb_t *kc_emb_open(void) {
         return NULL;
     }
 
-    FILE *f = fmemopen(model_gguf, model_gguf_len, "rb");
+    FILE *f = kc_fmemopen(model_gguf, model_gguf_len, "rb");
     if (!f) {
         free(ctx);
         return NULL;
@@ -238,10 +276,21 @@ kc_emb_t *kc_emb_open(void) {
     }
 
     for (int i = 0; i < ctx->n_vocab; i++) {
-        ctx->vocab[i] = strdup(gguf_get_arr_str(ctx->gguf, kid, i));
+        const char *token = gguf_get_arr_str(ctx->gguf, kid, i);
+        ctx->vocab[i] = token ? strdup(token) : NULL;
+        if (!ctx->vocab[i]) {
+            for (int j = 0; j < i; j++) free(ctx->vocab[j]);
+            free(ctx->vocab);
+            ctx->vocab = NULL;
+            goto failure;
+        }
     }
 
     if (build_vocab_hash(ctx) != 0) {
+        if (ctx->vocab_hash) {
+            free(ctx->vocab_hash);
+            ctx->vocab_hash = NULL;
+        }
         for (int i = 0; i < ctx->n_vocab; i++) {
             if (ctx->vocab[i]) free(ctx->vocab[i]);
         }
@@ -364,41 +413,53 @@ void kc_emb_close(kc_emb_t *ctx) {
 
     if (ctx->vocab) {
         for (int i = 0; i < ctx->n_vocab; i++) {
-            free(ctx->vocab[i]);
+            if (ctx->vocab[i]) {
+                free(ctx->vocab[i]);
+                ctx->vocab[i] = NULL;
+            }
         }
         free(ctx->vocab);
+        ctx->vocab = NULL;
     }
 
     if (ctx->vocab_hash) {
         free(ctx->vocab_hash);
+        ctx->vocab_hash = NULL;
     }
 
     if (ctx->layers) {
         free(ctx->layers);
+        ctx->layers = NULL;
     }
 
     if (ctx->compute_buf) {
         free(ctx->compute_buf);
+        ctx->compute_buf = NULL;
     }
 
     if (ctx->out) {
         free(ctx->out);
+        ctx->out = NULL;
     }
 
     if (ctx->galloc) {
         ggml_gallocr_free(ctx->galloc);
+        ctx->galloc = NULL;
     }
 
     if (ctx->backend) {
         ggml_backend_free(ctx->backend);
+        ctx->backend = NULL;
     }
 
     if (ctx->gguf) {
         gguf_free(ctx->gguf);
+        ctx->gguf = NULL;
     }
 
     if (ctx->ctx) {
         ggml_free(ctx->ctx);
+        ctx->ctx = NULL;
     }
 
     free(ctx);
@@ -428,15 +489,13 @@ static void wordpiece_tokenize(
     int *n_tokens
 ) {
     *n_tokens = 0;
-    tokens[(*n_tokens)++] = ctx->cls_token_id;
+    if (*n_tokens < ctx->n_ctx) {
+        tokens[(*n_tokens)++] = ctx->cls_token_id;
+    }
 
     int len = strlen(input);
     int i = 0;
 
-    /**
-     * Note: This tokenizer uses fixed 128-byte buffers for words and subwords.
-     * Tokens exceeding this length will be truncated to prevent overflows.
-     */
     while (i < len && *n_tokens < ctx->n_ctx - 1) {
         while (i < len && kc_isspace((uint8_t)input[i])) i++;
         if (i >= len) break;
@@ -444,7 +503,9 @@ static void wordpiece_tokenize(
         if (kc_ispunct((uint8_t)input[i])) {
             char p[2] = { (char)kc_tolower((uint8_t)input[i]), '\0' };
             int id = find_token(ctx, p);
-            tokens[(*n_tokens)++] = id >= 0 ? id : ctx->unk_token_id;
+            if (*n_tokens < ctx->n_ctx) {
+                tokens[(*n_tokens)++] = id >= 0 ? id : ctx->unk_token_id;
+            }
             i++;
             continue;
         }
@@ -497,11 +558,15 @@ static void wordpiece_tokenize(
             }
 
             if (best_id == -1) {
-                tokens[(*n_tokens)++] = ctx->unk_token_id;
+                if (*n_tokens < ctx->n_ctx) {
+                    tokens[(*n_tokens)++] = ctx->unk_token_id;
+                }
                 break;
             }
 
-            tokens[(*n_tokens)++] = best_id;
+            if (*n_tokens < ctx->n_ctx) {
+                tokens[(*n_tokens)++] = best_id;
+            }
             start = best_end;
         }
 
