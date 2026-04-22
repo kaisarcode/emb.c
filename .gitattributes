@@ -1,6 +1,5 @@
 # Large generated model data treated as binary to avoid heavy diffs
-model.c -text
-
+model.c filter=lfs diff=lfs merge=lfs -text
 # Source files and documentation
 *.c text
 *.h text
@@ -11,4 +10,3 @@ model.c -text
 # GGML library structure
 ggml/include/** text
 ggml/src/** text
-model.c filter=lfs diff=lfs merge=lfs -text

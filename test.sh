@@ -38,11 +38,18 @@ kc_test_main() {
 
     kc_test_check_binary || exit 1
 
-    if ! ./emb "test-input" > /dev/null; then
-        kc_test_fail "basic execution"
+    if ! ./emb "test-input" > /dev/null 2>&1; then
+        kc_test_fail "basic execution (parameter)"
         failed=$((failed + 1))
     else
-        kc_test_pass "basic execution"
+        kc_test_pass "basic execution (parameter)"
+    fi
+
+    if ! printf "test-input-stdin" | ./emb > /dev/null 2>&1; then
+        kc_test_fail "basic execution (stdin)"
+        failed=$((failed + 1))
+    else
+        kc_test_pass "basic execution (stdin)"
     fi
 
     if [ "$failed" -eq 0 ]; then
