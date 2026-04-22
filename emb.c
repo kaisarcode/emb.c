@@ -71,13 +71,28 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
-        input_text = argv[1];
+        size_t total = 0;
+        for (int i = 1; i < argc; i++) {
+            total += strlen(argv[i]) + 1;
+        }
+
+        input_text = (char *)malloc(total + 1);
+        if (!input_text) {
+            fprintf(stderr, "emb: out of memory\n");
+            return 1;
+        }
+
+        input_text[0] = '\0';
+        for (int i = 1; i < argc; i++) {
+            strcat(input_text, argv[i]);
+            if (i != argc - 1) strcat(input_text, " ");
+        }
     }
 
     ctx = kc_emb_open();
     if (!ctx) {
-        fprintf(stderr, "emb: out of memory\n");
-        if (argc < 2) free(input_text);
+        fprintf(stderr, "emb: initialization failed\n");
+        if (argc >= 2) free(input_text);
         return 1;
     }
 
@@ -86,11 +101,11 @@ int main(int argc, char **argv) {
     if (rc != KC_EMB_OK) {
         fprintf(stderr, "emb: execution failed\n");
         kc_emb_close(ctx);
-        if (argc < 2) free(input_text);
+        if (argc >= 2) free(input_text);
         return 1;
     }
 
     kc_emb_close(ctx);
-    if (argc < 2) free(input_text);
+    if (argc >= 2) free(input_text);
     return 0;
 }
