@@ -89,6 +89,8 @@ struct kc_emb {
     size_t compute_buf_size;
     ggml_backend_t backend;
     ggml_gallocr_t galloc;
+
+    float *out;
 };
 
 /**
@@ -320,6 +322,11 @@ kc_emb_t *kc_emb_open(void) {
         goto failure;
     }
 
+    ctx->out = (float *)malloc(ctx->n_embd * sizeof(float));
+    if (!ctx->out) {
+        goto failure;
+    }
+
     return ctx;
 
 failure:
@@ -356,6 +363,10 @@ void kc_emb_close(kc_emb_t *ctx) {
         free(ctx->compute_buf);
     }
 
+    if (ctx->out) {
+        free(ctx->out);
+    }
+
     if (ctx->galloc) {
         ggml_gallocr_free(ctx->galloc);
     }
@@ -373,6 +384,15 @@ void kc_emb_close(kc_emb_t *ctx) {
     }
 
     free(ctx);
+}
+
+/**
+ * Retrieve the embedding dimension.
+ * @param ctx Context pointer.
+ * @return Dimension size.
+ */
+int kc_emb_dim(kc_emb_t *ctx) {
+    return ctx ? ctx->n_embd : 0;
 }
 
 /**
@@ -479,20 +499,20 @@ static void wordpiece_tokenize(
  * Generate embeddings for the given input text.
  * @param ctx Context pointer.
  * @param input Text input.
- * @return Status code.
+ * @return Pointer to embedding vector or NULL on failure.
  */
-int kc_emb_exec(kc_emb_t *ctx, const char *input) {
-    if (!ctx || !input) return KC_EMB_ERROR;
+float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
+    if (!ctx || !input) return NULL;
 
     int *tokens = (int *)malloc(ctx->n_ctx * sizeof(int));
-    if (!tokens) return KC_EMB_ERROR;
+    if (!tokens) return NULL;
 
     int n_tokens = 0;
     wordpiece_tokenize(ctx, input, tokens, &n_tokens);
 
     if (n_tokens <= 0 || n_tokens > ctx->n_ctx) {
         free(tokens);
-        return KC_EMB_ERROR;
+        return NULL;
     }
 
     struct ggml_init_params params = {
@@ -504,14 +524,14 @@ int kc_emb_exec(kc_emb_t *ctx, const char *input) {
     struct ggml_context *ctx0 = ggml_init(params);
     if (!ctx0) {
         free(tokens);
-        return KC_EMB_ERROR;
+        return NULL;
     }
 
     struct ggml_cgraph *gf = ggml_new_graph(ctx0);
     if (!gf) {
         ggml_free(ctx0);
         free(tokens);
-        return KC_EMB_ERROR;
+        return NULL;
     }
 
     struct ggml_tensor *inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -521,7 +541,7 @@ int kc_emb_exec(kc_emb_t *ctx, const char *input) {
     if (!inp_tokens || !inp_pos || !inp_type) {
         ggml_free(ctx0);
         free(tokens);
-        return KC_EMB_ERROR;
+        return NULL;
     }
 
     struct ggml_tensor *cur = ggml_get_rows(ctx0, ctx->token_embd, inp_tokens);
@@ -531,7 +551,7 @@ int kc_emb_exec(kc_emb_t *ctx, const char *input) {
     if (!cur || !pos || !typ) {
         ggml_free(ctx0);
         free(tokens);
-        return KC_EMB_ERROR;
+        return NULL;
     }
 
     cur = ggml_add(ctx0, cur, pos);
@@ -580,12 +600,13 @@ int kc_emb_exec(kc_emb_t *ctx, const char *input) {
         cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].layer_norm_w), ctx->layers[il].layer_norm_b);
     }
 
+    cur = ggml_cont(ctx0, cur);
     ggml_build_forward_expand(gf, cur);
 
     if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
         ggml_free(ctx0);
         free(tokens);
-        return KC_EMB_ERROR;
+        return NULL;
     }
 
     memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
@@ -595,19 +616,10 @@ int kc_emb_exec(kc_emb_t *ctx, const char *input) {
 
     ggml_backend_graph_compute(ctx->backend, gf);
 
-    /**
-     * Note: This implementation assumes CLS pooling (returning the first
-     * token's embedding). The output corresponds to the first row of
-     * the final context tensor.
-     */
-    float *out_data = (float *)cur->data;
-    for (int i = 0; i < ctx->n_embd; i++) {
-        printf("%f%s", out_data[i], i == ctx->n_embd - 1 ? "" : " ");
-    }
-    printf("\n");
+    memcpy(ctx->out, cur->data, ctx->n_embd * sizeof(float));
 
     ggml_free(ctx0);
     free(tokens);
 
-    return KC_EMB_OK;
+    return ctx->out;
 }

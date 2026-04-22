@@ -34,12 +34,25 @@ kc_emb_t *kc_emb_open(void);
 void kc_emb_close(kc_emb_t *ctx);
 
 /**
+ * Retrieve the embedding dimension.
+ * @param ctx Context pointer.
+ * @return Dimension size.
+ */
+int kc_emb_dim(kc_emb_t *ctx);
+
+/**
  * Execute a core emb operation.
  * @param ctx Context pointer.
  * @param input Operation input.
- * @return Status code.
+ * @return Pointer to embedding vector or NULL on failure.
+ *
+ * Note:
+ * - The returned pointer is owned by the context.
+ * - It remains valid until the next call to kc_emb_exec()
+ *   or until kc_emb_close() is called.
+ * - The caller must NOT free this pointer.
  */
-int kc_emb_exec(kc_emb_t *ctx, const char *input);
+float *kc_emb_exec(kc_emb_t *ctx, const char *input);
 
 #ifdef __cplusplus
 }

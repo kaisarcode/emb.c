@@ -37,6 +37,9 @@ int main(int argc, char **argv) {
     int allocated = 0;
     int status = 0;
 
+    float *vec = NULL;
+    int dim = 0;
+
     if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         kc_print_help(argv[0]);
         return 0;
@@ -121,10 +124,21 @@ int main(int argc, char **argv) {
         goto failure;
     }
 
-    if (kc_emb_exec(ctx, input_text) != KC_EMB_OK) {
+    vec = kc_emb_exec(ctx, input_text);
+    if (!vec) {
         fprintf(stderr, "emb: execution failed\n");
         goto failure;
     }
+
+    dim = kc_emb_dim(ctx);
+    if (dim <= 0) {
+        fprintf(stderr, "emb: invalid embedding dimension\n");
+        goto failure;
+    }
+    for (int i = 0; i < dim; i++) {
+        printf("%f%s", vec[i], (i == dim - 1) ? "" : " ");
+    }
+    printf("\n");
 
     goto cleanup;
 
