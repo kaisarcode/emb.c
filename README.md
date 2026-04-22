@@ -26,46 +26,20 @@ To build the library, you need:
 To keep development fast, we compile the large model data separately and build `ggml` as a static library so they only link during the final stage. 
 This 3-stage process allows you to iterate on your code instantly without recompiling massive files.
 
-### POSIX
+### Build (Linux & Windows)
+
+The project uses a unified CMake build system that automatically optimizes the engine for your local hardware.
 
 ```bash
-# 1. Compile the model data once (creates a ~24MB object)
-gcc -O2 -c model.c -o model.o
+# 1. Configure the project
+# This will detect your CPU features (AVX2, AVX512, etc.)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-# 2. Compile GGML into a static library
-GGML_FLAGS="-O2 -c -D_GNU_SOURCE -DGGML_VERSION=\"1\" -DGGML_COMMIT=\"custom\" -DGGML_CPU_GENERIC -Iggml/include -Iggml/src -Iggml/src/ggml-cpu"
-
-mkdir -p .ggml-build
-# Compile all GGML sources dynamically, keeping directory structure to avoid name collisions
-for f in ggml/src/*.c ggml/src/ggml-cpu/*.c; do gcc $GGML_FLAGS $f -o .ggml-build/$(basename $f).o; done
-for f in ggml/src/*.cpp ggml/src/ggml-cpu/*.cpp; do g++ $GGML_FLAGS $f -o .ggml-build/$(basename $f).o; done
-
-ar rcs libggml.a .ggml-build/*.o && rm -rf .ggml-build
-
-# 3. Build and link the engine
-g++ -O2 -I. -Iggml/include -Iggml/src -Iggml/src/ggml-cpu emb.c libemb.c model.o libggml.a -o emb -lm -lpthread
-```
-
-### Windows
-
-For Windows, it is highly recommended to use the official CMake build process for GGML to generate `ggml.lib`, then link it.
-
-```batch
-:: 1. Compile the model data once
-cl /c /O2 model.c /Fo:model.obj
-
-:: 2. Build GGML (Using CMake)
-cd ggml
-cmake -B build -A x64
+# 2. Build the engine
 cmake --build build --config Release
-cd ..
-
-:: 3. Build and link your library
-cl /O2 /W4 /I. /Iggml/include /Iggml/src /Iggml/src/ggml-cpu ^
-    emb.c libemb.c model.obj ^
-    ggml/build/src/Release/ggml.lib ^
-    /Fe:emb.exe
 ```
+
+The resulting binary will be located in `build/emb` (Linux) or `build/bin/Release/emb.exe` (Windows).
 
 ---
 
