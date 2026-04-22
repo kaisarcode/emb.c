@@ -398,6 +398,7 @@ kc_emb_t *kc_emb_open(void) {
     if (!ctx->backend) {
         goto failure;
     }
+    ggml_backend_cpu_set_n_threads(ctx->backend, 4);
 
     ctx->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
     if (!ctx->galloc) {

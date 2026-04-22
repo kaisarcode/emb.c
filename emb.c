@@ -136,9 +136,8 @@ int main(int argc, char **argv) {
         goto failure;
     }
     for (int i = 0; i < dim; i++) {
-        printf("%f%s", vec[i], (i == dim - 1) ? "" : " ");
+        printf("%.6f%c", vec[i], (i == dim - 1) ? '\n' : ' ');
     }
-    printf("\n");
 
     goto cleanup;
 

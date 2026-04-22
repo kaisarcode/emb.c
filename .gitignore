@@ -1,6 +1,5 @@
 /emb
+ggml/obj/
 *.o
 *.so
 *.a
-*.exe
-*.tmp
