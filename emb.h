@@ -51,6 +51,7 @@ int kc_emb_dim(kc_emb_t *ctx);
  * - It remains valid until the next call to kc_emb_exec()
  *   or until kc_emb_close() is called.
  * - The caller must NOT free this pointer.
+ * - This function is NOT thread-safe for the same context.
  */
 float *kc_emb_exec(kc_emb_t *ctx, const char *input);
 

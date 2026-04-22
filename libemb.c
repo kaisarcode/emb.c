@@ -502,56 +502,66 @@ static void wordpiece_tokenize(
  * @return Pointer to embedding vector or NULL on failure.
  */
 float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
+    int *tokens = NULL;
+    int n_tokens = 0;
+    struct ggml_init_params params;
+    struct ggml_context *ctx0 = NULL;
+    struct ggml_tensor *inp_tokens = NULL;
+    struct ggml_tensor *inp_pos = NULL;
+    struct ggml_tensor *inp_type = NULL;
+    int *pos_data = NULL;
+    struct ggml_cgraph *gf = NULL;
+    struct ggml_tensor *cur = NULL;
+    struct ggml_tensor *pos = NULL;
+    struct ggml_tensor *typ = NULL;
+    int d_head = 0;
+
     if (!ctx || !input) return NULL;
 
-    int *tokens = (int *)malloc(ctx->n_ctx * sizeof(int));
+    tokens = (int *)malloc(ctx->n_ctx * sizeof(int));
     if (!tokens) return NULL;
 
-    int n_tokens = 0;
     wordpiece_tokenize(ctx, input, tokens, &n_tokens);
 
-    if (n_tokens <= 0 || n_tokens > ctx->n_ctx) {
+    if (n_tokens < 2 || n_tokens > ctx->n_ctx) {
         free(tokens);
         return NULL;
     }
 
-    struct ggml_init_params params = {
-        .mem_size   = ctx->compute_buf_size,
-        .mem_buffer = ctx->compute_buf,
-        .no_alloc   = true,
-    };
+    params.mem_size   = ctx->compute_buf_size;
+    params.mem_buffer = ctx->compute_buf;
+    params.no_alloc   = false;
 
-    struct ggml_context *ctx0 = ggml_init(params);
+    ctx0 = ggml_init(params);
     if (!ctx0) {
         free(tokens);
         return NULL;
     }
 
-    struct ggml_cgraph *gf = ggml_new_graph(ctx0);
-    if (!gf) {
-        ggml_free(ctx0);
-        free(tokens);
-        return NULL;
-    }
-
-    struct ggml_tensor *inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    struct ggml_tensor *inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    struct ggml_tensor *inp_type = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp_type = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
 
     if (!inp_tokens || !inp_pos || !inp_type) {
-        ggml_free(ctx0);
-        free(tokens);
-        return NULL;
+        goto failure;
     }
 
-    struct ggml_tensor *cur = ggml_get_rows(ctx0, ctx->token_embd, inp_tokens);
-    struct ggml_tensor *pos = ggml_get_rows(ctx0, ctx->pos_embd, inp_pos);
-    struct ggml_tensor *typ = ggml_get_rows(ctx0, ctx->type_embd, inp_type);
+    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
+    pos_data = (int *)inp_pos->data;
+    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
+    memset(inp_type->data, 0, n_tokens * sizeof(int));
+
+    gf = ggml_new_graph(ctx0);
+    if (!gf) {
+        goto failure;
+    }
+
+    cur = ggml_get_rows(ctx0, ctx->token_embd, inp_tokens);
+    pos = ggml_get_rows(ctx0, ctx->pos_embd, inp_pos);
+    typ = ggml_get_rows(ctx0, ctx->type_embd, inp_type);
 
     if (!cur || !pos || !typ) {
-        ggml_free(ctx0);
-        free(tokens);
-        return NULL;
+        goto failure;
     }
 
     cur = ggml_add(ctx0, cur, pos);
@@ -559,7 +569,7 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
     cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
     cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->token_embd_norm_w), ctx->token_embd_norm_b);
 
-    int d_head = ctx->n_embd / ctx->n_head;
+    d_head = ctx->n_embd / ctx->n_head;
 
     for (int il = 0; il < ctx->n_layer; il++) {
         struct ggml_tensor *inp_L = cur;
@@ -604,22 +614,23 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
     ggml_build_forward_expand(gf, cur);
 
     if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
-        ggml_free(ctx0);
-        free(tokens);
-        return NULL;
+        goto failure;
     }
 
-    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
-    int *pos_data = (int *)inp_pos->data;
-    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
-    memset(inp_type->data, 0, n_tokens * sizeof(int));
-
     ggml_backend_graph_compute(ctx->backend, gf);
+
+    if (cur->ne[0] != ctx->n_embd) {
+        goto failure;
+    }
 
     memcpy(ctx->out, cur->data, ctx->n_embd * sizeof(float));
 
     ggml_free(ctx0);
     free(tokens);
-
     return ctx->out;
+
+failure:
+    if (ctx0) ggml_free(ctx0);
+    if (tokens) free(tokens);
+    return NULL;
 }
