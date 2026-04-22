@@ -394,6 +394,62 @@ kc_emb_t *kc_emb_open(void) {
         goto failure;
     }
 
+    {
+        struct ggml_init_params p = {
+            .mem_size   = ctx->compute_buf_size,
+            .mem_buffer = ctx->compute_buf,
+            .no_alloc   = true,
+        };
+        struct ggml_context *ctx0 = ggml_init(p);
+        if (ctx0) {
+            struct ggml_tensor *it = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
+            struct ggml_tensor *ip = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
+            struct ggml_tensor *ity = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
+            struct ggml_cgraph *gf = ggml_new_graph(ctx0);
+
+            struct ggml_tensor *cur = ggml_get_rows(ctx0, ctx->token_embd, it);
+            cur = ggml_add(ctx0, cur, ggml_get_rows(ctx0, ctx->pos_embd, ip));
+            cur = ggml_add(ctx0, cur, ggml_get_rows(ctx0, ctx->type_embd, ity));
+            cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->token_embd_norm_w), ctx->token_embd_norm_b);
+
+            int d_head = ctx->n_embd / ctx->n_head;
+            for (int il = 0; il < ctx->n_layer; il++) {
+                struct ggml_tensor *inp_L = cur;
+                struct ggml_tensor *q = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_q_w, cur), ctx->layers[il].attn_q_b);
+                struct ggml_tensor *k = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_k_w, cur), ctx->layers[il].attn_k_b);
+                struct ggml_tensor *v = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_v_w, cur), ctx->layers[il].attn_v_b);
+                q = ggml_reshape_3d(ctx0, q, d_head, ctx->n_head, ctx->n_ctx);
+                k = ggml_reshape_3d(ctx0, k, d_head, ctx->n_head, ctx->n_ctx);
+                v = ggml_reshape_3d(ctx0, v, d_head, ctx->n_head, ctx->n_ctx);
+                q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
+                k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
+                v = ggml_cont(ctx0, ggml_permute(ctx0, v, 1, 2, 0, 3));
+                struct ggml_tensor *kq = ggml_mul_mat(ctx0, q, k);
+                kq = ggml_scale_inplace(ctx0, kq, 1.0f / sqrtf((float)d_head));
+                kq = ggml_soft_max_inplace(ctx0, kq);
+                struct ggml_tensor *kqv = ggml_mul_mat(ctx0, v, kq);
+                kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
+                kqv = ggml_reshape_2d(ctx0, kqv, ctx->n_embd, ctx->n_ctx);
+                struct ggml_tensor *attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_out_w, kqv), ctx->layers[il].attn_out_b);
+                cur = ggml_add(ctx0, inp_L, attn_out);
+                cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].attn_norm_w), ctx->layers[il].attn_norm_b);
+                struct ggml_tensor *ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].ffn_up_w, cur), ctx->layers[il].ffn_up_b);
+                ffn = ggml_gelu(ctx0, ffn);
+                ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].ffn_down_w, ffn), ctx->layers[il].ffn_down_b);
+                cur = ggml_add(ctx0, cur, ffn);
+                cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].layer_norm_w), ctx->layers[il].layer_norm_b);
+            }
+            struct ggml_tensor *cls = ggml_view_2d(ctx0, cur, ctx->n_embd, 1, cur->nb[1], 0);
+            cls = ggml_cont(ctx0, cls);
+            ggml_build_forward_expand(gf, cls);
+            ggml_gallocr_reserve(ctx->galloc, gf);
+            ggml_free(ctx0);
+        }
+    }
+
     return ctx;
 
 failure:
@@ -628,8 +684,7 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         goto failure;
     }
 
-    for (int i = n_tokens; i < ctx->n_ctx; i++) tokens[i] = ctx->pad_token_id;
-    for (int i = 0; i < ctx->n_ctx; i++) pos_data[i] = i;
+    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
 
     params.mem_size   = ctx->compute_buf_size;
     params.mem_buffer = ctx->compute_buf;
@@ -640,13 +695,17 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         goto failure;
     }
 
-    inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
-    inp_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
-    inp_type   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx->n_ctx);
+    inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp_type   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
 
     if (!inp_tokens || !inp_pos || !inp_type) {
         goto failure;
     }
+
+    inp_tokens->data = tokens;
+    inp_pos->data = pos_data;
+    inp_type->data = type_data;
 
     gf = ggml_new_graph(ctx0);
     if (!gf) {
@@ -675,9 +734,9 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         struct ggml_tensor *k = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_k_w, cur), ctx->layers[il].attn_k_b);
         struct ggml_tensor *v = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_v_w, cur), ctx->layers[il].attn_v_b);
 
-        q = ggml_reshape_3d(ctx0, q, d_head, ctx->n_head, ctx->n_ctx);
-        k = ggml_reshape_3d(ctx0, k, d_head, ctx->n_head, ctx->n_ctx);
-        v = ggml_reshape_3d(ctx0, v, d_head, ctx->n_head, ctx->n_ctx);
+        q = ggml_reshape_3d(ctx0, q, d_head, ctx->n_head, n_tokens);
+        k = ggml_reshape_3d(ctx0, k, d_head, ctx->n_head, n_tokens);
+        v = ggml_reshape_3d(ctx0, v, d_head, ctx->n_head, n_tokens);
 
         q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
         k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
@@ -689,7 +748,7 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
 
         struct ggml_tensor *kqv = ggml_mul_mat(ctx0, v, kq);
         kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
-        kqv = ggml_reshape_2d(ctx0, kqv, ctx->n_embd, ctx->n_ctx);
+        kqv = ggml_reshape_2d(ctx0, kqv, ctx->n_embd, n_tokens);
 
         struct ggml_tensor *attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_out_w, kqv), ctx->layers[il].attn_out_b);
 
@@ -720,9 +779,9 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         goto failure;
     }
 
-    memcpy(inp_tokens->data, tokens, ctx->n_ctx * sizeof(int));
-    memcpy(inp_pos->data, pos_data, ctx->n_ctx * sizeof(int));
-    memset(inp_type->data, 0, ctx->n_ctx * sizeof(int));
+    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
+    memcpy(inp_pos->data, pos_data, n_tokens * sizeof(int));
+    memset(inp_type->data, 0, n_tokens * sizeof(int));
 
     ggml_backend_graph_compute(ctx->backend, gf);
 
