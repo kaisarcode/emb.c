@@ -521,17 +521,19 @@ static void wordpiece_tokenize(
  */
 float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
     int *tokens = NULL;
+    int *pos_data = NULL;
+    int *type_data = NULL;
     int n_tokens = 0;
     struct ggml_init_params params;
     struct ggml_context *ctx0 = NULL;
     struct ggml_tensor *inp_tokens = NULL;
     struct ggml_tensor *inp_pos = NULL;
     struct ggml_tensor *inp_type = NULL;
-    int *pos_data = NULL;
     struct ggml_cgraph *gf = NULL;
     struct ggml_tensor *cur = NULL;
     struct ggml_tensor *pos = NULL;
     struct ggml_tensor *typ = NULL;
+    struct ggml_tensor *cls = NULL;
     int d_head = 0;
     const char *prefix = "Represent this sentence for retrieval: ";
     char *norm_input = NULL;
@@ -546,18 +548,22 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
     snprintf(norm_input, norm_len, "%s%s", prefix, input);
 
     tokens = (int *)calloc(ctx->n_ctx, sizeof(int));
-    if (!tokens) {
-        free(norm_input);
-        return NULL;
+    pos_data = (int *)calloc(ctx->n_ctx, sizeof(int));
+    type_data = (int *)calloc(ctx->n_ctx, sizeof(int));
+
+    if (!tokens || !pos_data || !type_data) {
+        goto failure;
     }
 
     wordpiece_tokenize(ctx, norm_input, tokens, &n_tokens);
     free(norm_input);
+    norm_input = NULL;
 
     if (n_tokens < 2 || n_tokens > ctx->n_ctx) {
-        free(tokens);
-        return NULL;
+        goto failure;
     }
+
+    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
 
     params.mem_size   = ctx->compute_buf_size;
     params.mem_buffer = ctx->compute_buf;
@@ -565,13 +571,12 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
 
     ctx0 = ggml_init(params);
     if (!ctx0) {
-        free(tokens);
-        return NULL;
+        goto failure;
     }
 
     inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    inp_type = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    inp_type   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
 
     if (!inp_tokens || !inp_pos || !inp_type) {
         goto failure;
@@ -636,37 +641,42 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
         cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].layer_norm_w), ctx->layers[il].layer_norm_b);
     }
 
-    cur = ggml_cont(ctx0, cur);
-    ggml_build_forward_expand(gf, cur);
+    if (cur->ne[0] != ctx->n_embd) {
+        goto failure;
+    }
+
+    cls = ggml_view_2d(ctx0, cur, ctx->n_embd, 1, cur->nb[1], 0);
+    cls = ggml_cont(ctx0, cls);
+
+    ggml_build_forward_expand(gf, cls);
 
     if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
         goto failure;
     }
 
     memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
-    pos_data = (int *)inp_pos->data;
-    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
+    memcpy(inp_pos->data, pos_data, n_tokens * sizeof(int));
     memset(inp_type->data, 0, n_tokens * sizeof(int));
 
     ggml_backend_graph_compute(ctx->backend, gf);
 
-    if (!cur->data || cur->ne[0] != ctx->n_embd) {
+    if (!cls->data || cls->ne[0] != ctx->n_embd) {
         goto failure;
     }
 
-    {
-        uint8_t *data = (uint8_t *)cur->data;
-        for (int j = 0; j < ctx->n_embd; j++) {
-            ctx->out[j] = *(float *)(data + j * cur->nb[0]);
-        }
-    }
+    memcpy(ctx->out, cls->data, ctx->n_embd * sizeof(float));
 
     ggml_free(ctx0);
     free(tokens);
+    free(pos_data);
+    free(type_data);
     return ctx->out;
 
 failure:
     if (ctx0) ggml_free(ctx0);
     if (tokens) free(tokens);
+    if (pos_data) free(pos_data);
+    if (type_data) free(type_data);
+    if (norm_input) free(norm_input);
     return NULL;
 }
