@@ -18,48 +18,74 @@ int       kc_emb_exec(kc_emb_t *ctx, const char *input);
 
 ## Build Instructions
 
-To keep development fast, we compile the large model data separately so it only links during the final stage.
+To keep development fast, we compile the large model data separately and build `ggml` as a static library so they only link during the final stage. 
+This 3-stage process allows you to iterate on your code instantly without recompiling massive files.
 
-### POSIX (Linux, macOS, MinGW)
+### POSIX
 
 ```bash
 # 1. Compile the model data once (creates a ~24MB object)
-g++ -c -O2 model.c -o model.o
+gcc -O2 -c model.c -o model.o
 
-# 2. Build the engine (fast)
-g++ -O2 -Wno-pragma-once \
-    -DGGML_VERSION=\"1\" -DGGML_COMMIT=\"custom\" \
-    -I. -Iggml/include -Iggml/src -Iggml/src/ggml-cpu \
-    emb.c libemb.c model.o \
-    ggml/src/ggml.c \
-    ggml/src/ggml-quants.c \
-    ggml/src/ggml-alloc.c \
-    ggml/src/ggml-backend.cpp \
-    ggml/src/ggml-cpu/ggml-cpu.c \
-    -o emb -lm -lpthread
+# 2. Compile GGML into a static library (libggml.a)
+# Note: we use GGML_CPU_GENERIC for maximum portability. For performance, use native CMake.
+GGML_FLAGS="-O2 -D_GNU_SOURCE -DGGML_VERSION=\"1\" -DGGML_COMMIT=\"custom\" -DGGML_CPU_GENERIC -Iggml/include -Iggml/src -Iggml/src/ggml-cpu"
+
+# Compile C sources
+gcc $GGML_FLAGS -c ggml/src/ggml.c -o ggml.o
+gcc $GGML_FLAGS -c ggml/src/ggml-quants.c -o ggml-quants.o
+gcc $GGML_FLAGS -c ggml/src/ggml-alloc.c -o ggml-alloc.o
+gcc $GGML_FLAGS -c ggml/src/ggml-cpu/ggml-cpu.c -o ggml-cpu-c.o
+gcc $GGML_FLAGS -c ggml/src/ggml-cpu/quants.c -o quants-cpu.o
+
+# Compile C++ sources
+g++ $GGML_FLAGS -c ggml/src/ggml.cpp -o ggml-cpp.o
+g++ $GGML_FLAGS -c ggml/src/ggml-threading.cpp -o ggml-threading.o
+g++ $GGML_FLAGS -c ggml/src/gguf.cpp -o gguf.o
+g++ $GGML_FLAGS -c ggml/src/ggml-backend.cpp -o ggml-backend.o
+g++ $GGML_FLAGS -c ggml/src/ggml-backend-meta.cpp -o ggml-backend-meta.o
+g++ $GGML_FLAGS -c ggml/src/ggml-backend-reg.cpp -o ggml-backend-reg.o
+g++ $GGML_FLAGS -c ggml/src/ggml-cpu/ggml-cpu.cpp -o ggml-cpu-cpp.o
+g++ $GGML_FLAGS -c ggml/src/ggml-cpu/ops.cpp -o ops.o
+g++ $GGML_FLAGS -c ggml/src/ggml-cpu/unary-ops.cpp -o unary-ops.o
+g++ $GGML_FLAGS -c ggml/src/ggml-cpu/binary-ops.cpp -o binary-ops.o
+g++ $GGML_FLAGS -c ggml/src/ggml-cpu/vec.cpp -o vec.o
+g++ $GGML_FLAGS -c ggml/src/ggml-cpu/traits.cpp -o traits.o
+g++ $GGML_FLAGS -c ggml/src/ggml-cpu/repack.cpp -o repack.o
+
+# Create archive and clean up objects
+ar rcs libggml.a ggml.o ggml-quants.o ggml-alloc.o ggml-cpu-c.o quants-cpu.o ggml-cpp.o ggml-threading.o gguf.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg.o ggml-cpu-cpp.o ops.o unary-ops.o binary-ops.o vec.o traits.o repack.o
+rm -f ggml.o ggml-quants.o ggml-alloc.o ggml-cpu-c.o quants-cpu.o ggml-cpp.o ggml-threading.o gguf.o ggml-backend.o ggml-backend-meta.o ggml-backend-reg.o ggml-cpu-cpp.o ops.o unary-ops.o binary-ops.o vec.o traits.o repack.o
+
+# 3. Build and link the engine
+g++ -O2 -I. -Iggml/include -Iggml/src -Iggml/src/ggml-cpu emb.c libemb.c model.o libggml.a -o emb -lm -lpthread
 ```
 
-### Windows (MSVC)
+### Windows
+
+For Windows, it is highly recommended to use the official CMake build process for GGML to generate `ggml.lib`, then link it.
 
 ```batch
 :: 1. Compile the model data once
 cl /c /O2 model.c /Fo:model.obj
 
-:: 2. Build and link
+:: 2. Build GGML (Using CMake)
+cd ggml
+cmake -B build -A x64
+cmake --build build --config Release
+cd ..
+
+:: 3. Build and link your library
 cl /O2 /W4 /I. /Iggml/include /Iggml/src /Iggml/src/ggml-cpu ^
-    -DGGML_VERSION="1" -DGGML_COMMIT="custom" ^
     emb.c libemb.c model.obj ^
-    ggml/src/ggml.c ^
-    ggml/src/ggml-quants.c ^
-    ggml/src/ggml-alloc.c ^
-    ggml/src/ggml-backend.cpp ^
-    ggml/src/ggml-cpu/ggml-cpu.c ^
+    ggml/build/src/Release/ggml.lib ^
     /Fe:emb.exe
 ```
 
 ---
 
 ## Changing the Model
+
 
 If you wish to use a different GGUF-compatible model, you can replace the built-in one by generating a new `model.c`:
 
