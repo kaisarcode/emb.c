@@ -10,6 +10,7 @@
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#include <unistd.h>
 #endif
 
 #include "emb.h"
@@ -232,6 +233,47 @@ static uint32_t get_kv_u32(const struct gguf_context *ctx, const char *key, uint
 }
 
 /**
+ * Retrieve the thread count from KC_EMB_THREADS.
+ * @return Thread count on success, -1 on invalid.
+ */
+static int kc_emb_get_threads(void) {
+    const char *env = getenv("KC_EMB_THREADS");
+    int val = 0;
+    int i = 0;
+
+    if (!env) {
+#ifdef _WIN32
+        SYSTEM_INFO sysinfo;
+        GetSystemInfo(&sysinfo);
+        return sysinfo.dwNumberOfProcessors == 0 ? 1 : (int)sysinfo.dwNumberOfProcessors;
+#else
+        long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+        return nproc <= 0 ? 1 : (int)nproc;
+#endif
+    }
+
+    if (env[0] == '\0') {
+        return -1;
+    }
+
+    for (i = 0; env[i] != '\0'; i++) {
+        if (env[i] < '0' || env[i] > '9') {
+            return -1;
+        }
+        val = val * 10 + (env[i] - '0');
+        if (val > 1024) {
+            return -1;
+        }
+    }
+
+    if (val == 0) {
+        return -1;
+    }
+
+    return val;
+}
+
+/**
  * Initialize a new emb context.
  * @param none Unused.
  * @return Context pointer or NULL on failure.
@@ -394,11 +436,16 @@ kc_emb_t *kc_emb_open(void) {
         goto failure;
     }
 
+    int threads = kc_emb_get_threads();
+    if (threads < 0) {
+        goto failure;
+    }
+
     ctx->backend = ggml_backend_cpu_init();
     if (!ctx->backend) {
         goto failure;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend, 4);
+    ggml_backend_cpu_set_n_threads(ctx->backend, threads);
 
     ctx->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
     if (!ctx->galloc) {
