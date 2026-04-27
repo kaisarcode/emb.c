@@ -1,56 +1,94 @@
-# emb.c - Lightweight Vector Embedding Library
+# emb.c — Lightweight Vector Embedding Library
 
-A minimalist C library for vector embeddings using BERT-based models. Optimized for CPU inference with zero-copy weight mapping.
+A minimalist C library for generating vector embeddings using `bge-small-en-v1.5`. CPU inference, zero-copy weight mapping, model embedded at compile time.
 
----
+## File Layout
 
-## Performance
-The engine is optimized for local environments, achieving ~0.026s latency per inference on standard hardware.
-
----
-
-## Quick Start
-
-### 1. Build
-Requires a C++ compiler and CMake 3.14+.
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
 ```
-*The `emb` binary will be generated directly in the root directory.*
+emb.c/
+├── src/
+│   ├── emb.c          CLI entry point (main)
+│   ├── libemb.c       Core library implementation
+│   └── emb.h          Public API header
+├── lib/
+│   ├── ggml/          Vendored GGML dependency
+│   └── model.gguf     Embedded model (Git LFS)
+├── bin/               Compiled artifacts (committed, Git LFS)
+│   ├── x86_64/{linux,windows}
+│   ├── i686/{linux,windows}
+│   ├── aarch64/{linux,android}
+│   ├── armv7/{linux,android}
+│   ├── armv7hf/linux
+│   ├── riscv64/linux
+│   ├── powerpc64le/linux
+│   ├── mips/linux  mipsel/linux  mips64el/linux
+│   ├── s390x/linux
+│   └── loongarch64/linux
+├── CMakeLists.txt
+├── Makefile
+├── test.sh
+└── README.md
+```
 
-### 2. Usage
+## Build
+
+```bash
+make all              # all 16 targets
+make x86_64/linux
+make x86_64/windows
+make i686/linux
+make i686/windows
+make aarch64/linux
+make aarch64/android
+make armv7/linux
+make armv7/android
+make armv7hf/linux
+make riscv64/linux
+make powerpc64le/linux
+make mips/linux
+make mipsel/linux
+make mips64el/linux
+make s390x/linux
+make loongarch64/linux
+make clean
+```
+
+Each target produces under `bin/{arch}/{platform}/`:
+- `libemb.a` — static library
+- `libemb.so` / `libemb.dll` — shared library
+- `emb` / `emb.exe` — CLI executable
+
+## Usage
+
 ```c
 #include "emb.h"
 
-// Initialize context
 kc_emb_t *ctx = kc_emb_open();
-
-// Generate embeddings
-kc_emb_exec(ctx, "The cat is green");
-
-// Clean up
+float *vec = kc_emb_exec(ctx, "The cat is green");
+int dim = kc_emb_dim(ctx);
 kc_emb_close(ctx);
 ```
 
----
-
-## Features
-- **Native SIMD**: Leverages AVX2, AVX512, and NEON kernels.
-- **Zero-Copy**: Maps model weights directly from memory.
-- **Self-Contained**: Includes the `bge-small-en-v1.5` model.
-
----
-
 ## Changing the Model
-To use a different GGUF model:
-1. Generate `model.c`: `xxd -i your_model.gguf > model.c`
-2. Re-run the build command.
+
+Replace `lib/model.gguf` with any GGUF BERT-compatible model and rebuild.
+
+## Threading Model
+
+Single-context — serialized by caller. Not thread-safe for concurrent use of the same context.
+
+Set `KC_EMB_THREADS=N` to control CPU thread count.
+
+## Lifecycle
+
+- `kc_emb_open()` — allocates and returns a context owned by the caller.
+- `kc_emb_close()` — releases the context. Must not be called while other operations on the same context are active.
 
 ---
 
 **Author:** KaisarCode
 
-**Email:** <kaisar@kaisarcode.com>
+**Email:** <kaisarcode@gmail.com>
 
 **Website:** [https://kaisarcode.com](https://kaisarcode.com)
 

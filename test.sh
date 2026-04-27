@@ -23,7 +23,7 @@ kc_test_pass() {
 # Verifies the binary exists.
 # @return 0 on success, 1 on failure.
 kc_test_check_binary() {
-    if [ ! -x "./emb" ]; then
+    if [ ! -x "./bin/x86_64/linux/emb" ]; then
         return 1
     fi
 
@@ -37,21 +37,23 @@ kc_test_main() {
 
     kc_test_check_binary || exit 1
 
-    if ! ./emb "test-input" > /dev/null 2>&1; then
+    BIN="./bin/x86_64/linux/emb"
+
+    if ! "$BIN" "test-input" > /dev/null 2>&1; then
         kc_test_fail "basic execution (parameter)"
         failed=$((failed + 1))
     else
         kc_test_pass "basic execution (parameter)"
     fi
 
-    if ! printf "test-input-stdin" | ./emb > /dev/null 2>&1; then
+    if ! printf "test-input-stdin" | "$BIN" > /dev/null 2>&1; then
         kc_test_fail "basic execution (stdin)"
         failed=$((failed + 1))
     else
         kc_test_pass "basic execution (stdin)"
     fi
 
-    if ! KC_EMB_THREADS=1 ./emb "test-input" > /dev/null 2>&1; then
+    if ! KC_EMB_THREADS=1 "$BIN" "test-input" > /dev/null 2>&1; then
         kc_test_fail "KC_EMB_THREADS valid (1)"
         failed=$((failed + 1))
     else
@@ -59,7 +61,7 @@ kc_test_main() {
     fi
 
     for val in "0" "-1" "+1" "4x" "abc"; do
-        if KC_EMB_THREADS="$val" ./emb "test-input" > /dev/null 2>&1; then
+        if KC_EMB_THREADS="$val" "$BIN" "test-input" > /dev/null 2>&1; then
             kc_test_fail "KC_EMB_THREADS invalid ($val)"
             failed=$((failed + 1))
         else

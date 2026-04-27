@@ -1,12 +1,7 @@
-# Large generated model data treated as binary to avoid heavy diffs
-model.c filter=lfs diff=lfs merge=lfs -text
-# Source files and documentation
-*.c text
-*.h text
-*.cpp text
-*.md text
-# Shell scripts with fixed LF line endings
-*.sh text eol=lf
-# GGML library structure
-ggml/include/** text
-ggml/src/** text
+# Normalize line endings for text files
+* text=auto
+
+# Binaries — Git LFS
+bin/* filter=lfs diff=lfs merge=lfs -text
+bin/**/* filter=lfs diff=lfs merge=lfs -text
+lib/model.gguf filter=lfs diff=lfs merge=lfs -text

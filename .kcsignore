@@ -1,3 +1,2 @@
-build
-ggml
-model.c
+AGENTS.md
+lib/ggml

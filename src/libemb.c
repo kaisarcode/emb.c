@@ -32,8 +32,17 @@
 #include <windows.h>
 #endif
 
-extern unsigned char model_gguf[];
-extern unsigned int model_gguf_len;
+#if defined(_WIN32) && !defined(_WIN64)
+extern const unsigned char binary_model_gguf_start[] __asm__("_binary_model_gguf_start");
+extern const unsigned char binary_model_gguf_end[]   __asm__("_binary_model_gguf_end");
+#define model_gguf     ((unsigned char *)binary_model_gguf_start)
+#define model_gguf_len ((unsigned int)(binary_model_gguf_end - binary_model_gguf_start))
+#else
+extern const unsigned char _binary_model_gguf_start[];
+extern const unsigned char _binary_model_gguf_end[];
+#define model_gguf     ((unsigned char *)_binary_model_gguf_start)
+#define model_gguf_len ((unsigned int)(_binary_model_gguf_end - _binary_model_gguf_start))
+#endif
 
 typedef struct {
     char *str;
@@ -166,7 +175,7 @@ static int build_vocab_hash(kc_emb_t *ctx) {
  * @return FILE pointer or NULL on failure.
  */
 static FILE *kc_fmemopen(const void *buf, size_t size, const char *mode) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
     FILE *f = tmpfile();
     if (!f) return NULL;
     if (fwrite(buf, 1, size, f) != size) {
