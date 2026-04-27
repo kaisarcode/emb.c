@@ -150,5 +150,5 @@ test:
 	@sh test.sh
 
 clean:
-	@rm -rf $(BUILD_DIR) $(BIN_DIR)
+	@rm -rf $(BUILD_DIR)
 	@echo "OK clean"
