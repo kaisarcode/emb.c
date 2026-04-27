@@ -64,8 +64,9 @@ Each target produces under `bin/{arch}/{platform}/`:
 #include "emb.h"
 
 kc_emb_t *ctx = kc_emb_open();
-float *vec = kc_emb_exec(ctx, "The cat is green");
 int dim = kc_emb_dim(ctx);
+float out[384];
+kc_emb_exec(ctx, "The cat is green", out);
 kc_emb_close(ctx);
 ```
 
@@ -73,16 +74,11 @@ kc_emb_close(ctx);
 
 Replace `lib/model.gguf` with any GGUF BERT-compatible model and rebuild.
 
-## Threading Model
-
-Single-context — serialized by caller. Not thread-safe for concurrent use of the same context.
-
-Set `KC_EMB_THREADS=N` to control CPU thread count.
-
 ## Lifecycle
 
-- `kc_emb_open()` — allocates and returns a context owned by the caller.
-- `kc_emb_close()` — releases the context. Must not be called while other operations on the same context are active.
+- `kc_emb_open()` — allocates and returns a pool owned by the caller. Spawns one worker thread per available CPU. Each worker holds an independent GGML inference context backed by the embedded model binary (shared read-only memory).
+- `kc_emb_close()` — shuts down all workers and releases all resources. Must not be called while `kc_emb_exec()` is active on any thread.
+- `kc_emb_exec()` — dispatches to the next free worker and blocks until the result is ready. Multiple threads may call this concurrently on the same context.
 
 ---
 

@@ -21,13 +21,16 @@ typedef struct kc_emb kc_emb_t;
 
 /**
  * Initialize a new emb context.
- * @param none Unused.
+ * Spawns one worker thread per available CPU. Each worker holds an
+ * independent GGML inference context backed by the embedded model.
  * @return Context pointer or NULL on failure.
  */
 kc_emb_t *kc_emb_open(void);
 
 /**
  * Release a emb context.
+ * Shuts down all worker threads and frees all resources.
+ * Must not be called while kc_emb_exec() is active on any thread.
  * @param ctx Context pointer.
  * @return None.
  */
@@ -36,24 +39,21 @@ void kc_emb_close(kc_emb_t *ctx);
 /**
  * Retrieve the embedding dimension.
  * @param ctx Context pointer.
- * @return Dimension size.
+ * @return Dimension size, or 0 on invalid input.
  */
 int kc_emb_dim(kc_emb_t *ctx);
 
 /**
- * Execute a core emb operation.
+ * Generate an embedding for the given input text.
+ * Dispatches to the next available worker. Blocks if all workers are
+ * busy. Multiple threads may call this concurrently on the same context.
+ * The result is written into the caller-supplied buffer.
  * @param ctx Context pointer.
- * @param input Operation input.
- * @return Pointer to embedding vector or NULL on failure.
- *
- * Note:
- * - The returned pointer is owned by the context.
- * - It remains valid until the next call to kc_emb_exec()
- *   or until kc_emb_close() is called.
- * - The caller must NOT free this pointer.
- * - This function is NOT thread-safe for the same context.
+ * @param input Null-terminated input text.
+ * @param out Caller-supplied buffer of at least kc_emb_dim(ctx) floats.
+ * @return KC_EMB_OK on success, KC_EMB_ERROR on failure.
  */
-float *kc_emb_exec(kc_emb_t *ctx, const char *input);
+int kc_emb_exec(kc_emb_t *ctx, const char *input, float *out);
 
 #ifdef __cplusplus
 }

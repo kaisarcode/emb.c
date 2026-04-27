@@ -53,22 +53,6 @@ kc_test_main() {
         kc_test_pass "basic execution (stdin)"
     fi
 
-    if ! KC_EMB_THREADS=1 "$BIN" "test-input" > /dev/null 2>&1; then
-        kc_test_fail "KC_EMB_THREADS valid (1)"
-        failed=$((failed + 1))
-    else
-        kc_test_pass "KC_EMB_THREADS valid (1)"
-    fi
-
-    for val in "0" "-1" "+1" "4x" "abc"; do
-        if KC_EMB_THREADS="$val" "$BIN" "test-input" > /dev/null 2>&1; then
-            kc_test_fail "KC_EMB_THREADS invalid ($val)"
-            failed=$((failed + 1))
-        else
-            kc_test_pass "KC_EMB_THREADS invalid ($val)"
-        fi
-    done
-
     if [ "$failed" -eq 0 ]; then
         return 0
     fi

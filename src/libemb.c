@@ -28,7 +28,9 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
-#ifdef _WIN32
+#ifndef _WIN32
+#include <pthread.h>
+#else
 #include <windows.h>
 #endif
 
@@ -49,7 +51,7 @@ typedef struct {
     int id;
 } hash_entry;
 
-struct kc_emb_layer {
+typedef struct {
     struct ggml_tensor *attn_q_w;
     struct ggml_tensor *attn_q_b;
     struct ggml_tensor *attn_k_w;
@@ -66,9 +68,9 @@ struct kc_emb_layer {
     struct ggml_tensor *ffn_down_b;
     struct ggml_tensor *layer_norm_w;
     struct ggml_tensor *layer_norm_b;
-};
+} kc_emb_layer_t;
 
-struct kc_emb {
+typedef struct {
     struct ggml_context *ctx;
     struct gguf_context *gguf;
 
@@ -94,27 +96,64 @@ struct kc_emb {
     struct ggml_tensor *token_embd_norm_w;
     struct ggml_tensor *token_embd_norm_b;
 
-    struct kc_emb_layer *layers;
+    kc_emb_layer_t *layers;
 
     void *compute_buf;
     size_t compute_buf_size;
     ggml_backend_t backend;
     ggml_gallocr_t galloc;
+} kc_emb_ctx_t;
 
+typedef struct kc_emb_worker kc_emb_worker_t;
+
+struct kc_emb_worker {
+    kc_emb_ctx_t *ectx;
+
+#ifndef _WIN32
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_req;
+    pthread_cond_t cond_res;
+#else
+    HANDLE thread;
+    CRITICAL_SECTION mutex;
+    CONDITION_VARIABLE cond_req;
+    CONDITION_VARIABLE cond_res;
+#endif
+
+    const char *input;
     float *out;
+    int result;
+    int has_req;
+    int done;
+    int shutdown;
+};
+
+struct kc_emb {
+    kc_emb_worker_t *workers;
+    int n_workers;
+    int n_embd;
+
+#ifndef _WIN32
+    pthread_mutex_t pool_mutex;
+    pthread_cond_t pool_cond;
+#else
+    CRITICAL_SECTION pool_mutex;
+    CONDITION_VARIABLE pool_cond;
+#endif
 };
 
 /**
- * Check if a character is a space (ASCII only).
+ * Check if a character is ASCII whitespace.
  * @param c Input character.
- * @return 1 if space, 0 otherwise.
+ * @return 1 if whitespace, 0 otherwise.
  */
 static int kc_isspace(int c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
 }
 
 /**
- * Check if a character is punctuation (ASCII only).
+ * Check if a character is ASCII punctuation.
  * @param c Input character.
  * @return 1 if punctuation, 0 otherwise.
  */
@@ -123,7 +162,7 @@ static int kc_ispunct(int c) {
 }
 
 /**
- * Convert a character to lowercase (ASCII only).
+ * Convert an ASCII character to lowercase.
  * @param c Input character.
  * @return Lowercase character.
  */
@@ -132,7 +171,7 @@ static int kc_tolower(int c) {
 }
 
 /**
- * Generate a hash for a given string.
+ * Compute a djb2 hash for a string.
  * @param str Input string.
  * @return Hash value.
  */
@@ -144,31 +183,31 @@ static uint32_t hash_str(const char *str) {
 }
 
 /**
- * Initialize the vocabulary hash table.
- * @param ctx Context pointer.
- * @return 0 on success, -1 on failure.
+ * Build the vocabulary hash table from the loaded vocab array.
+ * @param ectx Worker context pointer.
+ * @return 0 on success, -1 on allocation failure.
  */
-static int build_vocab_hash(kc_emb_t *ctx) {
-    ctx->vocab_hash_size = ctx->n_vocab * 2 + 1;
-    ctx->vocab_hash = (hash_entry *)calloc(ctx->vocab_hash_size, sizeof(hash_entry));
+static int build_vocab_hash(kc_emb_ctx_t *ectx) {
+    ectx->vocab_hash_size = ectx->n_vocab * 2 + 1;
+    ectx->vocab_hash = (hash_entry *)calloc(ectx->vocab_hash_size, sizeof(hash_entry));
 
-    if (!ctx->vocab_hash) {
+    if (!ectx->vocab_hash) {
         return -1;
     }
 
-    for (int i = 0; i < ctx->n_vocab; i++) {
-        uint32_t h = hash_str(ctx->vocab[i]) % ctx->vocab_hash_size;
-        while (ctx->vocab_hash[h].str != NULL) {
-            h = (h + 1) % ctx->vocab_hash_size;
+    for (int i = 0; i < ectx->n_vocab; i++) {
+        uint32_t h = hash_str(ectx->vocab[i]) % ectx->vocab_hash_size;
+        while (ectx->vocab_hash[h].str != NULL) {
+            h = (h + 1) % ectx->vocab_hash_size;
         }
-        ctx->vocab_hash[h].str = ctx->vocab[i];
-        ctx->vocab_hash[h].id = i;
+        ectx->vocab_hash[h].str = ectx->vocab[i];
+        ectx->vocab_hash[h].id = i;
     }
     return 0;
 }
 
 /**
- * Portable implementation of fmemopen for systems that lack it (e.g. Windows).
+ * Portable fmemopen for platforms that lack it.
  * @param buf Data buffer.
  * @param size Buffer size.
  * @param mode Open mode.
@@ -194,7 +233,7 @@ static FILE *kc_fmemopen(const void *buf, size_t size, const char *mode) {
  * @param level Log level.
  * @param text Log text.
  * @param user_data User data pointer.
- * @return None.
+ * @return No return value.
  */
 static void kc_ggml_log_callback(enum ggml_log_level level, const char *text, void *user_data) {
     (void)level;
@@ -203,31 +242,31 @@ static void kc_ggml_log_callback(enum ggml_log_level level, const char *text, vo
 }
 
 /**
- * Search for a token ID in the vocabulary.
- * @param ctx Context pointer.
+ * Look up a token string in the vocabulary hash table.
+ * @param ectx Worker context pointer.
  * @param str Token string.
  * @return Token ID or -1 if not found.
  */
-static int find_token(kc_emb_t *ctx, const char *str) {
-    if (!ctx->vocab_hash || ctx->vocab_hash_size == 0) {
+static int find_token(kc_emb_ctx_t *ectx, const char *str) {
+    if (!ectx->vocab_hash || ectx->vocab_hash_size == 0) {
         return -1;
     }
 
-    uint32_t h = hash_str(str) % ctx->vocab_hash_size;
-    while (ctx->vocab_hash[h].str != NULL) {
-        if (strcmp(ctx->vocab_hash[h].str, str) == 0) {
-            return ctx->vocab_hash[h].id;
+    uint32_t h = hash_str(str) % ectx->vocab_hash_size;
+    while (ectx->vocab_hash[h].str != NULL) {
+        if (strcmp(ectx->vocab_hash[h].str, str) == 0) {
+            return ectx->vocab_hash[h].id;
         }
-        h = (h + 1) % ctx->vocab_hash_size;
+        h = (h + 1) % ectx->vocab_hash_size;
     }
     return -1;
 }
 
 /**
- * Retrieve a uint32 value from GGUF metadata with type flexibility.
- * @param ctx GGUF context.
+ * Read a uint32 metadata value from a GGUF context with type flexibility.
+ * @param ctx GGUF context pointer.
  * @param key Metadata key.
- * @param def Default value.
+ * @param def Default value if key is absent.
  * @return Metadata value or default.
  */
 static uint32_t get_kv_u32(const struct gguf_context *ctx, const char *key, uint32_t def) {
@@ -242,337 +281,219 @@ static uint32_t get_kv_u32(const struct gguf_context *ctx, const char *key, uint
 }
 
 /**
- * Retrieve the thread count from KC_EMB_THREADS.
- * @return Thread count on success, -1 on invalid.
+ * Release all resources held by a worker context.
+ * @param ectx Worker context pointer.
+ * @return No return value.
  */
-static int kc_emb_get_threads(void) {
-    const char *env = getenv("KC_EMB_THREADS");
-    int val = 0;
-    int i = 0;
+static void kc_emb_ctx_free(kc_emb_ctx_t *ectx) {
+    if (!ectx) return;
 
-    if (!env) {
-#ifdef _WIN32
-        SYSTEM_INFO sysinfo;
-        GetSystemInfo(&sysinfo);
-        return sysinfo.dwNumberOfProcessors == 0 ? 1 : (int)sysinfo.dwNumberOfProcessors;
-#else
-        long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-        return nproc <= 0 ? 1 : (int)nproc;
-#endif
+    if (ectx->vocab) {
+        free(ectx->vocab);
+        ectx->vocab = NULL;
     }
-
-    if (env[0] == '\0') {
-        return -1;
+    if (ectx->vocab_hash) {
+        free(ectx->vocab_hash);
+        ectx->vocab_hash = NULL;
     }
-
-    for (i = 0; env[i] != '\0'; i++) {
-        if (env[i] < '0' || env[i] > '9') {
-            return -1;
-        }
-        val = val * 10 + (env[i] - '0');
-        if (val > 1024) {
-            return -1;
-        }
+    if (ectx->layers) {
+        free(ectx->layers);
+        ectx->layers = NULL;
     }
-
-    if (val == 0) {
-        return -1;
+    if (ectx->compute_buf) {
+        free(ectx->compute_buf);
+        ectx->compute_buf = NULL;
     }
-
-    return val;
+    if (ectx->galloc) {
+        ggml_gallocr_free(ectx->galloc);
+        ectx->galloc = NULL;
+    }
+    if (ectx->backend) {
+        ggml_backend_free(ectx->backend);
+        ectx->backend = NULL;
+    }
+    if (ectx->gguf) {
+        gguf_free(ectx->gguf);
+        ectx->gguf = NULL;
+    }
+    if (ectx->ctx) {
+        ggml_free(ectx->ctx);
+        ectx->ctx = NULL;
+    }
+    free(ectx);
 }
 
 /**
- * Initialize a new emb context.
- * @param none Unused.
- * @return Context pointer or NULL on failure.
+ * Allocate and initialize one worker inference context.
+ * @return Worker context pointer or NULL on failure.
  */
-kc_emb_t *kc_emb_open(void) {
-    kc_emb_t *ctx = (kc_emb_t *)calloc(1, sizeof(kc_emb_t));
-    if (!ctx) {
-        return NULL;
-    }
+static kc_emb_ctx_t *kc_emb_ctx_open(void) {
+    kc_emb_ctx_t *ectx = (kc_emb_ctx_t *)calloc(1, sizeof(kc_emb_ctx_t));
+    if (!ectx) return NULL;
 
     FILE *f = kc_fmemopen(model_gguf, model_gguf_len, "rb");
     if (!f) {
-        free(ctx);
+        free(ectx);
         return NULL;
     }
 
     struct gguf_init_params params = {
         .no_alloc = true,
-        .ctx = &ctx->ctx,
+        .ctx = &ectx->ctx,
     };
 
-    ctx->gguf = gguf_init_from_file_ptr(f, params);
+    ectx->gguf = gguf_init_from_file_ptr(f, params);
     fclose(f);
 
-    if (!ctx->gguf) {
-        goto failure;
-    }
+    if (!ectx->gguf) goto failure;
 
     {
-        size_t data_offset = gguf_get_data_offset(ctx->gguf);
-        int n_tensors = gguf_get_n_tensors(ctx->gguf);
+        size_t data_offset = gguf_get_data_offset(ectx->gguf);
+        int n_tensors = gguf_get_n_tensors(ectx->gguf);
         for (int i = 0; i < n_tensors; i++) {
-            const char *name = gguf_get_tensor_name(ctx->gguf, i);
-            struct ggml_tensor *t = ggml_get_tensor(ctx->ctx, name);
+            const char *name = gguf_get_tensor_name(ectx->gguf, i);
+            struct ggml_tensor *t = ggml_get_tensor(ectx->ctx, name);
             if (t) {
-                t->data = (char *)model_gguf + data_offset + gguf_get_tensor_offset(ctx->gguf, i);
+                t->data = (char *)model_gguf + data_offset + gguf_get_tensor_offset(ectx->gguf, i);
             }
         }
     }
 
-    ctx->n_embd = (int)get_kv_u32(ctx->gguf, "bert.embedding_length", 0);
-    ctx->n_layer = (int)get_kv_u32(ctx->gguf, "bert.block_count", 0);
-    ctx->n_head = (int)get_kv_u32(ctx->gguf, "bert.attention.head_count", 0);
-    ctx->n_ctx = (int)get_kv_u32(ctx->gguf, "bert.context_length", 512);
+    ectx->n_embd  = (int)get_kv_u32(ectx->gguf, "bert.embedding_length", 0);
+    ectx->n_layer = (int)get_kv_u32(ectx->gguf, "bert.block_count", 0);
+    ectx->n_head  = (int)get_kv_u32(ectx->gguf, "bert.attention.head_count", 0);
+    ectx->n_ctx   = (int)get_kv_u32(ectx->gguf, "bert.context_length", 512);
 
-    if (ctx->n_embd <= 0 || ctx->n_layer <= 0 || ctx->n_head <= 0 || ctx->n_ctx <= 0 || (ctx->n_embd % ctx->n_head) != 0) {
+    if (ectx->n_embd <= 0 || ectx->n_layer <= 0 || ectx->n_head <= 0 || ectx->n_ctx <= 0
+        || (ectx->n_embd % ectx->n_head) != 0) {
         goto failure;
     }
 
-    int64_t kid;
-    kid = gguf_find_key(ctx->gguf, "bert.attention.layer_norm_epsilon");
-    ctx->layer_norm_eps = (kid >= 0) ? gguf_get_val_f32(ctx->gguf, kid) : 1e-12f;
+    {
+        int64_t kid;
+        kid = gguf_find_key(ectx->gguf, "bert.attention.layer_norm_epsilon");
+        ectx->layer_norm_eps = (kid >= 0) ? gguf_get_val_f32(ectx->gguf, kid) : 1e-12f;
 
-    kid = gguf_find_key(ctx->gguf, "tokenizer.ggml.tokens");
-    if (kid < 0) {
-        goto failure;
-    }
+        kid = gguf_find_key(ectx->gguf, "tokenizer.ggml.tokens");
+        if (kid < 0) goto failure;
 
-    ctx->n_vocab = (int)gguf_get_arr_n(ctx->gguf, kid);
-    if (ctx->n_vocab <= 0) {
-        goto failure;
-    }
+        ectx->n_vocab = (int)gguf_get_arr_n(ectx->gguf, kid);
+        if (ectx->n_vocab <= 0) goto failure;
 
-    ctx->vocab = (char **)malloc(ctx->n_vocab * sizeof(char *));
-    if (!ctx->vocab) {
-        goto failure;
-    }
+        ectx->vocab = (char **)malloc(ectx->n_vocab * sizeof(char *));
+        if (!ectx->vocab) goto failure;
 
-    for (int i = 0; i < ctx->n_vocab; i++) {
-        ctx->vocab[i] = (char *)gguf_get_arr_str(ctx->gguf, kid, i);
-    }
-
-    if (build_vocab_hash(ctx) != 0) {
-        if (ctx->vocab_hash) {
-            free(ctx->vocab_hash);
-            ctx->vocab_hash = NULL;
+        for (int i = 0; i < ectx->n_vocab; i++) {
+            ectx->vocab[i] = (char *)gguf_get_arr_str(ectx->gguf, kid, i);
         }
-        free(ctx->vocab);
-        ctx->vocab = NULL;
+
+        if (build_vocab_hash(ectx) != 0) {
+            if (ectx->vocab_hash) { free(ectx->vocab_hash); ectx->vocab_hash = NULL; }
+            free(ectx->vocab); ectx->vocab = NULL;
+            goto failure;
+        }
+
+        ectx->cls_token_id = (int)get_kv_u32(ectx->gguf, "tokenizer.ggml.cls_token_id", 101);
+        ectx->sep_token_id = (int)get_kv_u32(ectx->gguf, "tokenizer.ggml.sep_token_id", 102);
+        ectx->pad_token_id = (int)get_kv_u32(ectx->gguf, "tokenizer.ggml.pad_token_id", 0);
+        ectx->unk_token_id = (int)get_kv_u32(ectx->gguf, "tokenizer.ggml.unknown_token_id", 100);
+    }
+
+    ectx->token_embd       = ggml_get_tensor(ectx->ctx, "token_embd.weight");
+    ectx->pos_embd         = ggml_get_tensor(ectx->ctx, "position_embd.weight");
+    ectx->type_embd        = ggml_get_tensor(ectx->ctx, "token_types.weight");
+    ectx->token_embd_norm_w = ggml_get_tensor(ectx->ctx, "token_embd_norm.weight");
+    ectx->token_embd_norm_b = ggml_get_tensor(ectx->ctx, "token_embd_norm.bias");
+
+    if (!ectx->token_embd || !ectx->pos_embd || !ectx->type_embd
+        || !ectx->token_embd_norm_w || !ectx->token_embd_norm_b) {
         goto failure;
     }
 
-    ctx->cls_token_id = (int)get_kv_u32(ctx->gguf, "tokenizer.ggml.cls_token_id", 101);
-    ctx->sep_token_id = (int)get_kv_u32(ctx->gguf, "tokenizer.ggml.sep_token_id", 102);
-    ctx->pad_token_id = (int)get_kv_u32(ctx->gguf, "tokenizer.ggml.pad_token_id", 0);
-    ctx->unk_token_id = (int)get_kv_u32(ctx->gguf, "tokenizer.ggml.unknown_token_id", 100);
+    ectx->layers = (kc_emb_layer_t *)calloc(ectx->n_layer, sizeof(kc_emb_layer_t));
+    if (!ectx->layers) goto failure;
 
-    ctx->token_embd = ggml_get_tensor(ctx->ctx, "token_embd.weight");
-    ctx->pos_embd   = ggml_get_tensor(ctx->ctx, "position_embd.weight");
-    ctx->type_embd  = ggml_get_tensor(ctx->ctx, "token_types.weight");
-    ctx->token_embd_norm_w = ggml_get_tensor(ctx->ctx, "token_embd_norm.weight");
-    ctx->token_embd_norm_b = ggml_get_tensor(ctx->ctx, "token_embd_norm.bias");
-
-    if (!ctx->token_embd || !ctx->pos_embd || !ctx->type_embd || !ctx->token_embd_norm_w || !ctx->token_embd_norm_b) {
-        goto failure;
-    }
-
-    ctx->layers = (struct kc_emb_layer *)calloc(ctx->n_layer, sizeof(struct kc_emb_layer));
-    if (!ctx->layers) {
-        goto failure;
-    }
-
-    for (int i = 0; i < ctx->n_layer; i++) {
+    for (int i = 0; i < ectx->n_layer; i++) {
         char name[64];
-        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
-        ctx->layers[i].attn_q_w = ggml_get_tensor(ctx->ctx, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", i);
-        ctx->layers[i].attn_q_b = ggml_get_tensor(ctx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);       ectx->layers[i].attn_q_w   = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", i);         ectx->layers[i].attn_q_b   = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);       ectx->layers[i].attn_k_w   = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", i);         ectx->layers[i].attn_k_b   = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);       ectx->layers[i].attn_v_w   = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", i);         ectx->layers[i].attn_v_b   = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", i);  ectx->layers[i].attn_out_w  = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_output.bias", i);    ectx->layers[i].attn_out_b  = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_output_norm.weight", i); ectx->layers[i].attn_norm_w = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.attn_output_norm.bias", i);   ectx->layers[i].attn_norm_b = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", i);       ectx->layers[i].ffn_up_w   = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.ffn_up.bias", i);         ectx->layers[i].ffn_up_b   = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", i);     ectx->layers[i].ffn_down_w = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.ffn_down.bias", i);       ectx->layers[i].ffn_down_b = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.layer_output_norm.weight", i); ectx->layers[i].layer_norm_w = ggml_get_tensor(ectx->ctx, name);
+        snprintf(name, sizeof(name), "blk.%d.layer_output_norm.bias", i);   ectx->layers[i].layer_norm_b = ggml_get_tensor(ectx->ctx, name);
 
-        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
-        ctx->layers[i].attn_k_w = ggml_get_tensor(ctx->ctx, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", i);
-        ctx->layers[i].attn_k_b = ggml_get_tensor(ctx->ctx, name);
-
-        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);
-        ctx->layers[i].attn_v_w = ggml_get_tensor(ctx->ctx, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", i);
-        ctx->layers[i].attn_v_b = ggml_get_tensor(ctx->ctx, name);
-
-        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", i);
-        ctx->layers[i].attn_out_w = ggml_get_tensor(ctx->ctx, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_output.bias", i);
-        ctx->layers[i].attn_out_b = ggml_get_tensor(ctx->ctx, name);
-
-        snprintf(name, sizeof(name), "blk.%d.attn_output_norm.weight", i);
-        ctx->layers[i].attn_norm_w = ggml_get_tensor(ctx->ctx, name);
-        snprintf(name, sizeof(name), "blk.%d.attn_output_norm.bias", i);
-        ctx->layers[i].attn_norm_b = ggml_get_tensor(ctx->ctx, name);
-
-        snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", i);
-        ctx->layers[i].ffn_up_w = ggml_get_tensor(ctx->ctx, name);
-        snprintf(name, sizeof(name), "blk.%d.ffn_up.bias", i);
-        ctx->layers[i].ffn_up_b = ggml_get_tensor(ctx->ctx, name);
-
-        snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", i);
-        ctx->layers[i].ffn_down_w = ggml_get_tensor(ctx->ctx, name);
-        snprintf(name, sizeof(name), "blk.%d.ffn_down.bias", i);
-        ctx->layers[i].ffn_down_b = ggml_get_tensor(ctx->ctx, name);
-
-        snprintf(name, sizeof(name), "blk.%d.layer_output_norm.weight", i);
-        ctx->layers[i].layer_norm_w = ggml_get_tensor(ctx->ctx, name);
-        snprintf(name, sizeof(name), "blk.%d.layer_output_norm.bias", i);
-        ctx->layers[i].layer_norm_b = ggml_get_tensor(ctx->ctx, name);
-
-        if (!ctx->layers[i].attn_q_w || !ctx->layers[i].attn_q_b ||
-            !ctx->layers[i].attn_k_w || !ctx->layers[i].attn_k_b ||
-            !ctx->layers[i].attn_v_w || !ctx->layers[i].attn_v_b ||
-            !ctx->layers[i].attn_out_w || !ctx->layers[i].attn_out_b ||
-            !ctx->layers[i].attn_norm_w || !ctx->layers[i].attn_norm_b ||
-            !ctx->layers[i].ffn_up_w || !ctx->layers[i].ffn_up_b ||
-            !ctx->layers[i].ffn_down_w || !ctx->layers[i].ffn_down_b ||
-            !ctx->layers[i].layer_norm_w || !ctx->layers[i].layer_norm_b) {
+        if (!ectx->layers[i].attn_q_w || !ectx->layers[i].attn_q_b
+            || !ectx->layers[i].attn_k_w || !ectx->layers[i].attn_k_b
+            || !ectx->layers[i].attn_v_w || !ectx->layers[i].attn_v_b
+            || !ectx->layers[i].attn_out_w || !ectx->layers[i].attn_out_b
+            || !ectx->layers[i].attn_norm_w || !ectx->layers[i].attn_norm_b
+            || !ectx->layers[i].ffn_up_w || !ectx->layers[i].ffn_up_b
+            || !ectx->layers[i].ffn_down_w || !ectx->layers[i].ffn_down_b
+            || !ectx->layers[i].layer_norm_w || !ectx->layers[i].layer_norm_b) {
             goto failure;
         }
     }
 
-    ctx->compute_buf_size = 64 * 1024 * 1024;
-    ctx->compute_buf = malloc(ctx->compute_buf_size);
-    if (!ctx->compute_buf) {
-        goto failure;
-    }
+    ectx->compute_buf_size = 64 * 1024 * 1024;
+    ectx->compute_buf = malloc(ectx->compute_buf_size);
+    if (!ectx->compute_buf) goto failure;
 
-    int threads = kc_emb_get_threads();
-    if (threads < 0) {
-        goto failure;
-    }
+    ectx->backend = ggml_backend_cpu_init();
+    if (!ectx->backend) goto failure;
+    ggml_backend_cpu_set_n_threads(ectx->backend, 1);
 
-    ctx->backend = ggml_backend_cpu_init();
-    if (!ctx->backend) {
-        goto failure;
-    }
-    ggml_backend_cpu_set_n_threads(ctx->backend, threads);
-
-    ctx->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ctx->galloc) {
-        goto failure;
-    }
-
-    ctx->out = (float *)malloc(ctx->n_embd * sizeof(float));
-    if (!ctx->out) {
-        goto failure;
-    }
+    ectx->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ectx->backend));
+    if (!ectx->galloc) goto failure;
 
     ggml_log_set(kc_ggml_log_callback, NULL);
-
-    return ctx;
+    return ectx;
 
 failure:
-    kc_emb_close(ctx);
+    kc_emb_ctx_free(ectx);
     return NULL;
 }
 
 /**
- * Release a emb context.
- * @param ctx Context pointer.
- * @return None.
- */
-void kc_emb_close(kc_emb_t *ctx) {
-    if (!ctx) {
-        return;
-    }
-
-    if (ctx->vocab) {
-        free(ctx->vocab);
-        ctx->vocab = NULL;
-    }
-
-    if (ctx->vocab_hash) {
-        free(ctx->vocab_hash);
-        ctx->vocab_hash = NULL;
-    }
-
-    if (ctx->layers) {
-        free(ctx->layers);
-        ctx->layers = NULL;
-    }
-
-    if (ctx->compute_buf) {
-        free(ctx->compute_buf);
-        ctx->compute_buf = NULL;
-    }
-
-    if (ctx->out) {
-        free(ctx->out);
-        ctx->out = NULL;
-    }
-
-    if (ctx->galloc) {
-        ggml_gallocr_free(ctx->galloc);
-        ctx->galloc = NULL;
-    }
-
-    if (ctx->backend) {
-        ggml_backend_free(ctx->backend);
-        ctx->backend = NULL;
-    }
-
-    if (ctx->gguf) {
-        gguf_free(ctx->gguf);
-        ctx->gguf = NULL;
-    }
-
-    if (ctx->ctx) {
-        ggml_free(ctx->ctx);
-        ctx->ctx = NULL;
-    }
-
-    free(ctx);
-}
-
-/**
- * Retrieve the embedding dimension.
- * @param ctx Context pointer.
- * @return Dimension size.
- */
-int kc_emb_dim(kc_emb_t *ctx) {
-    return ctx ? ctx->n_embd : 0;
-}
-
-/**
- * Split input text into WordPiece tokens.
- * @param ctx Context pointer.
- * @param input Text input.
- * @param tokens Token ID output array.
- * @param n_tokens Token count output.
- * @return None.
+ * Tokenize input text using WordPiece segmentation.
+ * @param ectx Worker context pointer.
+ * @param input Input text.
+ * @param tokens Output token ID array.
+ * @param n_tokens Output token count.
+ * @return No return value.
  */
 static void wordpiece_tokenize(
-    kc_emb_t *ctx,
+    kc_emb_ctx_t *ectx,
     const char *input,
     int *tokens,
     int *n_tokens
 ) {
     *n_tokens = 0;
-    if (*n_tokens < ctx->n_ctx) {
-        tokens[(*n_tokens)++] = ctx->cls_token_id;
+    if (*n_tokens < ectx->n_ctx) {
+        tokens[(*n_tokens)++] = ectx->cls_token_id;
     }
 
     int len = strlen(input);
     int i = 0;
 
-    while (i < len && *n_tokens < ctx->n_ctx - 1) {
+    while (i < len && *n_tokens < ectx->n_ctx - 1) {
         while (i < len && kc_isspace((uint8_t)input[i])) i++;
         if (i >= len) break;
 
         if (kc_ispunct((uint8_t)input[i])) {
             char p[2] = { (char)kc_tolower((uint8_t)input[i]), '\0' };
-            int id = find_token(ctx, p);
-            if (*n_tokens < ctx->n_ctx) {
-                tokens[(*n_tokens)++] = id >= 0 ? id : ctx->unk_token_id;
+            int id = find_token(ectx, p);
+            if (*n_tokens < ectx->n_ctx) {
+                tokens[(*n_tokens)++] = id >= 0 ? id : ectx->unk_token_id;
             }
             i++;
             continue;
@@ -583,17 +504,12 @@ static void wordpiece_tokenize(
 
         int word_len = j - i;
         char word[128];
-
         if (word_len >= (int)sizeof(word)) word_len = sizeof(word) - 1;
-
-        for (int k = 0; k < word_len; k++) {
-            word[k] = (char)kc_tolower((uint8_t)input[i + k]);
-        }
+        for (int k = 0; k < word_len; k++) word[k] = (char)kc_tolower((uint8_t)input[i + k]);
         word[word_len] = '\0';
 
         int start = 0;
-
-        while (start < word_len && *n_tokens < ctx->n_ctx - 1) {
+        while (start < word_len && *n_tokens < ectx->n_ctx - 1) {
             int end = word_len;
             int best_id = -1;
             int best_end = -1;
@@ -601,154 +517,116 @@ static void wordpiece_tokenize(
             while (end > start) {
                 char subword[128];
                 int slen = 0;
-
-                if (start > 0) {
-                    subword[0] = '#';
-                    subword[1] = '#';
-                    slen = 2;
-                }
-
+                if (start > 0) { subword[0] = '#'; subword[1] = '#'; slen = 2; }
                 for (int k = start; k < end; k++) {
                     if (slen >= (int)sizeof(subword) - 1) break;
                     subword[slen++] = word[k];
                 }
-
                 subword[slen] = '\0';
-
-                int id = find_token(ctx, subword);
-                if (id >= 0) {
-                    best_id = id;
-                    best_end = end;
-                    break;
-                }
-
+                int id = find_token(ectx, subword);
+                if (id >= 0) { best_id = id; best_end = end; break; }
                 end--;
             }
 
             if (best_id == -1) {
-                if (*n_tokens < ctx->n_ctx) {
-                    tokens[(*n_tokens)++] = ctx->unk_token_id;
-                }
+                if (*n_tokens < ectx->n_ctx) tokens[(*n_tokens)++] = ectx->unk_token_id;
                 break;
             }
-
-            if (*n_tokens < ctx->n_ctx) {
-                tokens[(*n_tokens)++] = best_id;
-            }
+            if (*n_tokens < ectx->n_ctx) tokens[(*n_tokens)++] = best_id;
             start = best_end;
         }
-
         i = j;
     }
 
-    if (*n_tokens < ctx->n_ctx) {
-        tokens[(*n_tokens)++] = ctx->sep_token_id;
-    }
+    if (*n_tokens < ectx->n_ctx) tokens[(*n_tokens)++] = ectx->sep_token_id;
 }
 
 /**
- * Generate embeddings for the given input text.
- * @param ctx Context pointer.
- * @param input Text input.
- * @return Pointer to embedding vector or NULL on failure.
+ * Run inference on one worker context and write the result to out.
+ * @param ectx Worker context pointer.
+ * @param input Input text.
+ * @param out Caller-supplied output buffer of n_embd floats.
+ * @return KC_EMB_OK on success, KC_EMB_ERROR on failure.
  */
-float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
+static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
     int *tokens = NULL;
     int *pos_data = NULL;
     int *type_data = NULL;
     int n_tokens = 0;
-    struct ggml_init_params params;
     struct ggml_context *ctx0 = NULL;
     struct ggml_tensor *inp_tokens = NULL;
     struct ggml_tensor *inp_pos = NULL;
     struct ggml_tensor *inp_type = NULL;
     struct ggml_cgraph *gf = NULL;
     struct ggml_tensor *cur = NULL;
-    struct ggml_tensor *pos = NULL;
-    struct ggml_tensor *typ = NULL;
     struct ggml_tensor *cls = NULL;
     int d_head = 0;
     const char *prefix = "Represent this sentence for retrieval: ";
     char *norm_input = NULL;
     size_t norm_len = 0;
 
-    if (!ctx || !input) return NULL;
+    if (!ectx || !input || !out) return KC_EMB_ERROR;
 
     norm_len = strlen(prefix) + strlen(input) + 1;
     norm_input = (char *)malloc(norm_len);
-    if (!norm_input) return NULL;
-
+    if (!norm_input) return KC_EMB_ERROR;
     snprintf(norm_input, norm_len, "%s%s", prefix, input);
 
-    tokens = (int *)calloc(ctx->n_ctx, sizeof(int));
-    pos_data = (int *)calloc(ctx->n_ctx, sizeof(int));
-    type_data = (int *)calloc(ctx->n_ctx, sizeof(int));
+    tokens    = (int *)calloc(ectx->n_ctx, sizeof(int));
+    pos_data  = (int *)calloc(ectx->n_ctx, sizeof(int));
+    type_data = (int *)calloc(ectx->n_ctx, sizeof(int));
+    if (!tokens || !pos_data || !type_data) goto failure;
 
-    if (!tokens || !pos_data || !type_data) {
-        goto failure;
-    }
+    wordpiece_tokenize(ectx, norm_input, tokens, &n_tokens);
+    free(norm_input); norm_input = NULL;
 
-    wordpiece_tokenize(ctx, norm_input, tokens, &n_tokens);
-    free(norm_input);
-    norm_input = NULL;
-
-    if (n_tokens < 2 || n_tokens > ctx->n_ctx) {
-        goto failure;
-    }
+    if (n_tokens < 2 || n_tokens > ectx->n_ctx) goto failure;
 
     for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
 
-    params.mem_size   = ctx->compute_buf_size;
-    params.mem_buffer = ctx->compute_buf;
-    params.no_alloc   = true;
-
-    ctx0 = ggml_init(params);
-    if (!ctx0) {
-        goto failure;
+    {
+        struct ggml_init_params params;
+        params.mem_size   = ectx->compute_buf_size;
+        params.mem_buffer = ectx->compute_buf;
+        params.no_alloc   = true;
+        ctx0 = ggml_init(params);
     }
+    if (!ctx0) goto failure;
 
     inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     inp_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     inp_type   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-
-    if (!inp_tokens || !inp_pos || !inp_type) {
-        goto failure;
-    }
+    if (!inp_tokens || !inp_pos || !inp_type) goto failure;
 
     inp_tokens->data = tokens;
-    inp_pos->data = pos_data;
-    inp_type->data = type_data;
+    inp_pos->data    = pos_data;
+    inp_type->data   = type_data;
 
     gf = ggml_new_graph(ctx0);
-    if (!gf) {
-        goto failure;
+    if (!gf) goto failure;
+
+    cur = ggml_get_rows(ctx0, ectx->token_embd, inp_tokens);
+    {
+        struct ggml_tensor *pos = ggml_get_rows(ctx0, ectx->pos_embd, inp_pos);
+        struct ggml_tensor *typ = ggml_get_rows(ctx0, ectx->type_embd, inp_type);
+        if (!cur || !pos || !typ) goto failure;
+        cur = ggml_add(ctx0, cur, pos);
+        cur = ggml_add(ctx0, cur, typ);
     }
+    cur = ggml_norm(ctx0, cur, ectx->layer_norm_eps);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ectx->token_embd_norm_w), ectx->token_embd_norm_b);
 
-    cur = ggml_get_rows(ctx0, ctx->token_embd, inp_tokens);
-    pos = ggml_get_rows(ctx0, ctx->pos_embd, inp_pos);
-    typ = ggml_get_rows(ctx0, ctx->type_embd, inp_type);
+    d_head = ectx->n_embd / ectx->n_head;
 
-    if (!cur || !pos || !typ) {
-        goto failure;
-    }
-
-    cur = ggml_add(ctx0, cur, pos);
-    cur = ggml_add(ctx0, cur, typ);
-    cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->token_embd_norm_w), ctx->token_embd_norm_b);
-
-    d_head = ctx->n_embd / ctx->n_head;
-
-    for (int il = 0; il < ctx->n_layer; il++) {
+    for (int il = 0; il < ectx->n_layer; il++) {
         struct ggml_tensor *inp_L = cur;
+        struct ggml_tensor *q = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].attn_q_w, cur), ectx->layers[il].attn_q_b);
+        struct ggml_tensor *k = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].attn_k_w, cur), ectx->layers[il].attn_k_b);
+        struct ggml_tensor *v = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].attn_v_w, cur), ectx->layers[il].attn_v_b);
 
-        struct ggml_tensor *q = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_q_w, cur), ctx->layers[il].attn_q_b);
-        struct ggml_tensor *k = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_k_w, cur), ctx->layers[il].attn_k_b);
-        struct ggml_tensor *v = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_v_w, cur), ctx->layers[il].attn_v_b);
-
-        q = ggml_reshape_3d(ctx0, q, d_head, ctx->n_head, n_tokens);
-        k = ggml_reshape_3d(ctx0, k, d_head, ctx->n_head, n_tokens);
-        v = ggml_reshape_3d(ctx0, v, d_head, ctx->n_head, n_tokens);
+        q = ggml_reshape_3d(ctx0, q, d_head, ectx->n_head, n_tokens);
+        k = ggml_reshape_3d(ctx0, k, d_head, ectx->n_head, n_tokens);
+        v = ggml_reshape_3d(ctx0, v, d_head, ectx->n_head, n_tokens);
 
         q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
         k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
@@ -760,60 +638,348 @@ float *kc_emb_exec(kc_emb_t *ctx, const char *input) {
 
         struct ggml_tensor *kqv = ggml_mul_mat(ctx0, v, kq);
         kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
-        kqv = ggml_reshape_2d(ctx0, kqv, ctx->n_embd, n_tokens);
+        kqv = ggml_reshape_2d(ctx0, kqv, ectx->n_embd, n_tokens);
 
-        struct ggml_tensor *attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].attn_out_w, kqv), ctx->layers[il].attn_out_b);
-
+        struct ggml_tensor *attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].attn_out_w, kqv), ectx->layers[il].attn_out_b);
         cur = ggml_add(ctx0, inp_L, attn_out);
-        cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].attn_norm_w), ctx->layers[il].attn_norm_b);
+        cur = ggml_norm(ctx0, cur, ectx->layer_norm_eps);
+        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ectx->layers[il].attn_norm_w), ectx->layers[il].attn_norm_b);
 
         struct ggml_tensor *inp_F = cur;
-        struct ggml_tensor *ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].ffn_up_w, cur), ctx->layers[il].ffn_up_b);
+        struct ggml_tensor *ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].ffn_up_w, cur), ectx->layers[il].ffn_up_b);
         ffn = ggml_gelu(ctx0, ffn);
-        ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ctx->layers[il].ffn_down_w, ffn), ctx->layers[il].ffn_down_b);
+        ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].ffn_down_w, ffn), ectx->layers[il].ffn_down_b);
 
         cur = ggml_add(ctx0, inp_F, ffn);
-        cur = ggml_norm(ctx0, cur, ctx->layer_norm_eps);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ctx->layers[il].layer_norm_w), ctx->layers[il].layer_norm_b);
+        cur = ggml_norm(ctx0, cur, ectx->layer_norm_eps);
+        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ectx->layers[il].layer_norm_w), ectx->layers[il].layer_norm_b);
     }
 
-    if (cur->ne[0] != ctx->n_embd) {
-        goto failure;
-    }
+    if (cur->ne[0] != ectx->n_embd) goto failure;
 
-    cls = ggml_view_2d(ctx0, cur, ctx->n_embd, 1, cur->nb[1], 0);
+    cls = ggml_view_2d(ctx0, cur, ectx->n_embd, 1, cur->nb[1], 0);
     cls = ggml_cont(ctx0, cls);
-
     ggml_build_forward_expand(gf, cls);
 
-    if (!ggml_gallocr_alloc_graph(ctx->galloc, gf)) {
-        goto failure;
-    }
+    if (!ggml_gallocr_alloc_graph(ectx->galloc, gf)) goto failure;
 
-    memcpy(inp_tokens->data, tokens, n_tokens * sizeof(int));
-    memcpy(inp_pos->data, pos_data, n_tokens * sizeof(int));
-    memset(inp_type->data, 0, n_tokens * sizeof(int));
+    memcpy(inp_tokens->data, tokens,    n_tokens * sizeof(int));
+    memcpy(inp_pos->data,    pos_data,  n_tokens * sizeof(int));
+    memset(inp_type->data,   0,         n_tokens * sizeof(int));
 
-    ggml_backend_graph_compute(ctx->backend, gf);
+    ggml_backend_graph_compute(ectx->backend, gf);
 
-    if (!cls->data || cls->ne[0] != ctx->n_embd) {
-        goto failure;
-    }
+    if (!cls->data || cls->ne[0] != ectx->n_embd) goto failure;
 
-    memcpy(ctx->out, cls->data, ctx->n_embd * sizeof(float));
+    memcpy(out, cls->data, ectx->n_embd * sizeof(float));
 
     ggml_free(ctx0);
     free(tokens);
     free(pos_data);
     free(type_data);
-    return ctx->out;
+    return KC_EMB_OK;
 
 failure:
-    if (ctx0) ggml_free(ctx0);
-    if (tokens) free(tokens);
-    if (pos_data) free(pos_data);
+    if (ctx0)      ggml_free(ctx0);
+    if (tokens)    free(tokens);
+    if (pos_data)  free(pos_data);
     if (type_data) free(type_data);
     if (norm_input) free(norm_input);
+    return KC_EMB_ERROR;
+}
+
+#ifndef _WIN32
+/**
+ * Worker thread entry point. Waits for requests and executes inference.
+ * @param arg Pointer to the worker struct.
+ * @return NULL on completion.
+ */
+static void *kc_emb_worker_thread(void *arg) {
+#else
+/**
+ * Worker thread entry point. Waits for requests and executes inference.
+ * @param arg Pointer to the worker struct.
+ * @return 0 on completion.
+ */
+static DWORD WINAPI kc_emb_worker_thread(LPVOID arg) {
+#endif
+    kc_emb_worker_t *w = (kc_emb_worker_t *)arg;
+
+#ifndef _WIN32
+    pthread_mutex_lock(&w->mutex);
+    while (!w->shutdown) {
+        while (!w->has_req && !w->shutdown) {
+            pthread_cond_wait(&w->cond_req, &w->mutex);
+        }
+        if (w->shutdown) break;
+        w->result = kc_emb_ctx_exec(w->ectx, w->input, w->out);
+        w->has_req = 0;
+        w->done = 1;
+        pthread_cond_signal(&w->cond_res);
+    }
+    pthread_mutex_unlock(&w->mutex);
     return NULL;
+#else
+    EnterCriticalSection(&w->mutex);
+    while (!w->shutdown) {
+        while (!w->has_req && !w->shutdown) {
+            SleepConditionVariableCS(&w->cond_req, &w->mutex, INFINITE);
+        }
+        if (w->shutdown) break;
+        w->result = kc_emb_ctx_exec(w->ectx, w->input, w->out);
+        w->has_req = 0;
+        w->done = 1;
+        WakeConditionVariable(&w->cond_res);
+    }
+    LeaveCriticalSection(&w->mutex);
+    return 0;
+#endif
+}
+
+/**
+ * Initialize a worker: allocate its context and start its thread.
+ * @param w Worker pointer.
+ * @return 0 on success, -1 on failure.
+ */
+static int kc_emb_worker_init(kc_emb_worker_t *w) {
+    w->ectx = kc_emb_ctx_open();
+    if (!w->ectx) return -1;
+
+    w->input    = NULL;
+    w->out      = NULL;
+    w->result   = 0;
+    w->has_req  = 0;
+    w->done     = 0;
+    w->shutdown = 0;
+
+#ifndef _WIN32
+    if (pthread_mutex_init(&w->mutex, NULL) != 0) {
+        kc_emb_ctx_free(w->ectx); w->ectx = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&w->cond_req, NULL) != 0) {
+        pthread_mutex_destroy(&w->mutex);
+        kc_emb_ctx_free(w->ectx); w->ectx = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&w->cond_res, NULL) != 0) {
+        pthread_cond_destroy(&w->cond_req);
+        pthread_mutex_destroy(&w->mutex);
+        kc_emb_ctx_free(w->ectx); w->ectx = NULL;
+        return -1;
+    }
+    if (pthread_create(&w->thread, NULL, kc_emb_worker_thread, w) != 0) {
+        pthread_cond_destroy(&w->cond_res);
+        pthread_cond_destroy(&w->cond_req);
+        pthread_mutex_destroy(&w->mutex);
+        kc_emb_ctx_free(w->ectx); w->ectx = NULL;
+        return -1;
+    }
+#else
+    InitializeCriticalSection(&w->mutex);
+    InitializeConditionVariable(&w->cond_req);
+    InitializeConditionVariable(&w->cond_res);
+    w->thread = CreateThread(NULL, 0, kc_emb_worker_thread, w, 0, NULL);
+    if (!w->thread) {
+        DeleteCriticalSection(&w->mutex);
+        kc_emb_ctx_free(w->ectx); w->ectx = NULL;
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+/**
+ * Signal a worker to shut down, join its thread, and free its context.
+ * @param w Worker pointer.
+ * @return No return value.
+ */
+static void kc_emb_worker_destroy(kc_emb_worker_t *w) {
+#ifndef _WIN32
+    pthread_mutex_lock(&w->mutex);
+    w->shutdown = 1;
+    pthread_cond_signal(&w->cond_req);
+    pthread_mutex_unlock(&w->mutex);
+    pthread_join(w->thread, NULL);
+    pthread_cond_destroy(&w->cond_res);
+    pthread_cond_destroy(&w->cond_req);
+    pthread_mutex_destroy(&w->mutex);
+#else
+    EnterCriticalSection(&w->mutex);
+    w->shutdown = 1;
+    WakeConditionVariable(&w->cond_req);
+    LeaveCriticalSection(&w->mutex);
+    WaitForSingleObject(w->thread, INFINITE);
+    CloseHandle(w->thread);
+    DeleteCriticalSection(&w->mutex);
+#endif
+    kc_emb_ctx_free(w->ectx);
+    w->ectx = NULL;
+}
+
+/**
+ * Initialize a new emb pool.
+ * @return Pool pointer or NULL on failure.
+ */
+kc_emb_t *kc_emb_open(void) {
+    int n_workers;
+
+#ifdef _WIN32
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    n_workers = sysinfo.dwNumberOfProcessors == 0 ? 1 : (int)sysinfo.dwNumberOfProcessors;
+#else
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    n_workers = nproc <= 0 ? 1 : (int)nproc;
+#endif
+
+    kc_emb_t *ctx = (kc_emb_t *)calloc(1, sizeof(kc_emb_t));
+    if (!ctx) return NULL;
+
+    ctx->workers = (kc_emb_worker_t *)calloc(n_workers, sizeof(kc_emb_worker_t));
+    if (!ctx->workers) { free(ctx); return NULL; }
+
+#ifndef _WIN32
+    if (pthread_mutex_init(&ctx->pool_mutex, NULL) != 0) {
+        free(ctx->workers); free(ctx); return NULL;
+    }
+    if (pthread_cond_init(&ctx->pool_cond, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->pool_mutex);
+        free(ctx->workers); free(ctx); return NULL;
+    }
+#else
+    InitializeCriticalSection(&ctx->pool_mutex);
+    InitializeConditionVariable(&ctx->pool_cond);
+#endif
+
+    int started = 0;
+    for (int i = 0; i < n_workers; i++) {
+        if (kc_emb_worker_init(&ctx->workers[i]) != 0) break;
+        started++;
+    }
+
+    if (started == 0) {
+        for (int i = 0; i < started; i++) kc_emb_worker_destroy(&ctx->workers[i]);
+#ifndef _WIN32
+        pthread_cond_destroy(&ctx->pool_cond);
+        pthread_mutex_destroy(&ctx->pool_mutex);
+#else
+        DeleteCriticalSection(&ctx->pool_mutex);
+#endif
+        free(ctx->workers); free(ctx); return NULL;
+    }
+
+    ctx->n_workers = started;
+    ctx->n_embd    = ctx->workers[0].ectx->n_embd;
+    return ctx;
+}
+
+/**
+ * Release a emb pool and shut down all workers.
+ * @param ctx Pool pointer.
+ * @return No return value.
+ */
+void kc_emb_close(kc_emb_t *ctx) {
+    if (!ctx) return;
+    for (int i = 0; i < ctx->n_workers; i++) kc_emb_worker_destroy(&ctx->workers[i]);
+#ifndef _WIN32
+    pthread_cond_destroy(&ctx->pool_cond);
+    pthread_mutex_destroy(&ctx->pool_mutex);
+#else
+    DeleteCriticalSection(&ctx->pool_mutex);
+#endif
+    free(ctx->workers);
+    free(ctx);
+}
+
+/**
+ * Retrieve the embedding dimension.
+ * @param ctx Pool pointer.
+ * @return Dimension size, or 0 on invalid input.
+ */
+int kc_emb_dim(kc_emb_t *ctx) {
+    return ctx ? ctx->n_embd : 0;
+}
+
+/**
+ * Generate an embedding for the given input text.
+ * @param ctx Pool pointer.
+ * @param input Null-terminated input text.
+ * @param out Caller-supplied buffer of at least kc_emb_dim(ctx) floats.
+ * @return KC_EMB_OK on success, KC_EMB_ERROR on failure.
+ */
+int kc_emb_exec(kc_emb_t *ctx, const char *input, float *out) {
+    kc_emb_worker_t *w = NULL;
+
+    if (!ctx || !input || !out) return KC_EMB_ERROR;
+
+#ifndef _WIN32
+    pthread_mutex_lock(&ctx->pool_mutex);
+    while (1) {
+        for (int i = 0; i < ctx->n_workers; i++) {
+            kc_emb_worker_t *cand = &ctx->workers[i];
+            pthread_mutex_lock(&cand->mutex);
+            if (!cand->has_req) {
+                w = cand;
+                break;
+            }
+            pthread_mutex_unlock(&cand->mutex);
+        }
+        if (w) break;
+        pthread_cond_wait(&ctx->pool_cond, &ctx->pool_mutex);
+    }
+    pthread_mutex_unlock(&ctx->pool_mutex);
+
+    w->input  = input;
+    w->out    = out;
+    w->done   = 0;
+    w->has_req = 1;
+    pthread_cond_signal(&w->cond_req);
+
+    while (!w->done) {
+        pthread_cond_wait(&w->cond_res, &w->mutex);
+    }
+    int result = w->result;
+    pthread_mutex_unlock(&w->mutex);
+
+    pthread_mutex_lock(&ctx->pool_mutex);
+    pthread_cond_signal(&ctx->pool_cond);
+    pthread_mutex_unlock(&ctx->pool_mutex);
+
+    return result;
+#else
+    EnterCriticalSection(&ctx->pool_mutex);
+    while (1) {
+        for (int i = 0; i < ctx->n_workers; i++) {
+            kc_emb_worker_t *cand = &ctx->workers[i];
+            EnterCriticalSection(&cand->mutex);
+            if (!cand->has_req) {
+                w = cand;
+                break;
+            }
+            LeaveCriticalSection(&cand->mutex);
+        }
+        if (w) break;
+        SleepConditionVariableCS(&ctx->pool_cond, &ctx->pool_mutex, INFINITE);
+    }
+    LeaveCriticalSection(&ctx->pool_mutex);
+
+    w->input  = input;
+    w->out    = out;
+    w->done   = 0;
+    w->has_req = 1;
+    WakeConditionVariable(&w->cond_req);
+
+    while (!w->done) {
+        SleepConditionVariableCS(&w->cond_res, &w->mutex, INFINITE);
+    }
+    int result = w->result;
+    LeaveCriticalSection(&w->mutex);
+
+    EnterCriticalSection(&ctx->pool_mutex);
+    WakeConditionVariable(&ctx->pool_cond);
+    LeaveCriticalSection(&ctx->pool_mutex);
+
+    return result;
+#endif
 }
