@@ -20,10 +20,54 @@ kc_test_pass() {
     printf '\033[32m[PASS]\033[0m %s\n' "$1"
 }
 
+# Detects the artifact architecture for the current machine.
+# @return Architecture name on stdout.
+kc_test_arch() {
+    case "$(uname -m)" in
+        x86_64 | amd64)
+            printf '%s\n' "x86_64"
+            ;;
+        aarch64 | arm64)
+            printf '%s\n' "aarch64"
+            ;;
+        armv7l | armv7)
+            printf '%s\n' "armv7"
+            ;;
+        i386 | i486 | i586 | i686)
+            printf '%s\n' "i686"
+            ;;
+        ppc64le | powerpc64le)
+            printf '%s\n' "powerpc64le"
+            ;;
+        *)
+            uname -m
+            ;;
+    esac
+}
+
+# Detects the artifact platform for the current machine.
+# @return Platform name on stdout.
+kc_test_platform() {
+    case "$(uname -s)" in
+        Linux)
+            printf '%s\n' "linux"
+            ;;
+        *)
+            uname -s | tr '[:upper:]' '[:lower:]'
+            ;;
+    esac
+}
+
+# Returns the CLI path for the current architecture and platform.
+# @return CLI path on stdout.
+kc_test_binary_path() {
+    printf './bin/%s/%s/emb\n' "$(kc_test_arch)" "$(kc_test_platform)"
+}
+
 # Verifies the binary exists.
 # @return 0 on success, 1 on failure.
 kc_test_check_binary() {
-    if [ ! -x "./bin/x86_64/linux/emb" ]; then
+    if [ ! -x "$BIN" ]; then
         return 1
     fi
 
@@ -35,9 +79,9 @@ kc_test_check_binary() {
 kc_test_main() {
     failed=0
 
-    kc_test_check_binary || exit 1
+    BIN=$(kc_test_binary_path)
 
-    BIN="./bin/x86_64/linux/emb"
+    kc_test_check_binary || exit 1
 
     if ! "$BIN" "test-input" > /dev/null 2>&1; then
         kc_test_fail "basic execution (parameter)"
