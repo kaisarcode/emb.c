@@ -215,6 +215,7 @@ static int build_vocab_hash(kc_emb_ctx_t *ectx) {
  */
 static FILE *kc_fmemopen(const void *buf, size_t size, const char *mode) {
 #if defined(_WIN32) || defined(__ANDROID__)
+    (void)mode;
     FILE *f = tmpfile();
     if (!f) return NULL;
     if (fwrite(buf, 1, size, f) != size) {

@@ -14,10 +14,10 @@ set(CMAKE_CXX_STANDARD 17)
 ## ── Compiler flags ────────────────────────────────────────────────────────────
 
 if(NOT MSVC)
-    add_compile_options(-O3 -fno-finite-math-only)
+    add_compile_options(-O3 -fno-finite-math-only -Wall -Wextra -Werror)
     add_definitions(-D_GNU_SOURCE -DGGML_USE_CPU -DGGML_VERSION="1" -DGGML_COMMIT="custom")
 else()
-    add_compile_options(/O2 /arch:AVX2)
+    add_compile_options(/O2 /arch:AVX2 /W4 /WX)
     add_definitions(-DGGML_USE_CPU -DGGML_VERSION="1" -DGGML_COMMIT="custom")
 endif()
 
@@ -89,17 +89,17 @@ foreach(GGML_SOURCE ${GGML_SOURCES})
     endif()
 endforeach()
 
-if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(
         ${GGML_C_SOURCES}
-        PROPERTIES COMPILE_OPTIONS "-Wno-pointer-to-int-cast;-Wno-psabi"
+        PROPERTIES COMPILE_OPTIONS "-Wno-pointer-to-int-cast;-Wno-psabi;-Wno-unused-function;-Wno-unused-variable"
     )
 endif()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(
         ${GGML_CXX_SOURCES}
-        PROPERTIES COMPILE_OPTIONS "-Wno-psabi"
+        PROPERTIES COMPILE_OPTIONS "-Wno-psabi;-Wno-unused-function;-Wno-unused-variable"
     )
 endif()
 
