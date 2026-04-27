@@ -77,6 +77,31 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64")
 endif()
 
 set(GGML_SOURCES ${GGML_BASE_SOURCES} ${GGML_ARCH_SOURCES})
+set(GGML_C_SOURCES "")
+set(GGML_CXX_SOURCES "")
+
+foreach(GGML_SOURCE ${GGML_SOURCES})
+    get_filename_component(GGML_SOURCE_EXT "${GGML_SOURCE}" EXT)
+    if(GGML_SOURCE_EXT STREQUAL ".c")
+        list(APPEND GGML_C_SOURCES "${GGML_SOURCE}")
+    elseif(GGML_SOURCE_EXT STREQUAL ".cpp")
+        list(APPEND GGML_CXX_SOURCES "${GGML_SOURCE}")
+    endif()
+endforeach()
+
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(
+        ${GGML_C_SOURCES}
+        PROPERTIES COMPILE_OPTIONS "-Wno-pointer-to-int-cast;-Wno-psabi"
+    )
+endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(
+        ${GGML_CXX_SOURCES}
+        PROPERTIES COMPILE_OPTIONS "-Wno-psabi"
+    )
+endif()
 
 ## ── Embed model ───────────────────────────────────────────────────────────────
 
@@ -184,7 +209,7 @@ endif()
 
 set(LIB_SOURCES src/libemb.c ${GGML_SOURCES})
 
-add_library(emb_static STATIC ${LIB_SOURCES})
+add_library(emb_static STATIC ${LIB_SOURCES} ${MODEL_EMBED_SOURCES})
 set_target_properties(emb_static PROPERTIES OUTPUT_NAME "emb")
 target_include_directories(emb_static PRIVATE src lib/ggml/include lib/ggml/src lib/ggml/src/ggml-cpu)
 
