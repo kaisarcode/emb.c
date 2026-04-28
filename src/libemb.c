@@ -102,6 +102,13 @@ typedef struct {
     size_t compute_buf_size;
     ggml_backend_t backend;
     ggml_gallocr_t galloc;
+
+    int n_threads;
+    int *tokens;
+    int *pos_data;
+    int *type_data;
+    char *norm_input;
+    size_t norm_input_size;
 } kc_emb_ctx_t;
 
 typedef struct kc_emb_worker kc_emb_worker_t;
@@ -168,6 +175,31 @@ static int kc_ispunct(int c) {
  */
 static int kc_tolower(int c) {
     return (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+}
+
+/**
+ * Count available CPU threads for one inference worker.
+ * @return Positive CPU count.
+ */
+static int kc_emb_cpu_count(void) {
+#ifdef _WIN32
+    SYSTEM_INFO sysinfo;
+
+    GetSystemInfo(&sysinfo);
+    if (sysinfo.dwNumberOfProcessors == 0) {
+        return 1;
+    }
+    return sysinfo.dwNumberOfProcessors > 4 ? 4 :
+        (int)sysinfo.dwNumberOfProcessors;
+#else
+    long nproc;
+
+    nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nproc <= 0) {
+        return 1;
+    }
+    return nproc > 4 ? 4 : (int)nproc;
+#endif
 }
 
 /**
@@ -304,6 +336,22 @@ static void kc_emb_ctx_free(kc_emb_ctx_t *ectx) {
     if (ectx->compute_buf) {
         free(ectx->compute_buf);
         ectx->compute_buf = NULL;
+    }
+    if (ectx->tokens) {
+        free(ectx->tokens);
+        ectx->tokens = NULL;
+    }
+    if (ectx->pos_data) {
+        free(ectx->pos_data);
+        ectx->pos_data = NULL;
+    }
+    if (ectx->type_data) {
+        free(ectx->type_data);
+        ectx->type_data = NULL;
+    }
+    if (ectx->norm_input) {
+        free(ectx->norm_input);
+        ectx->norm_input = NULL;
     }
     if (ectx->galloc) {
         ggml_gallocr_free(ectx->galloc);
@@ -449,9 +497,15 @@ static kc_emb_ctx_t *kc_emb_ctx_open(void) {
     ectx->compute_buf = malloc(ectx->compute_buf_size);
     if (!ectx->compute_buf) goto failure;
 
+    ectx->tokens = (int *)calloc((size_t)ectx->n_ctx, sizeof(int));
+    ectx->pos_data = (int *)calloc((size_t)ectx->n_ctx, sizeof(int));
+    ectx->type_data = (int *)calloc((size_t)ectx->n_ctx, sizeof(int));
+    if (!ectx->tokens || !ectx->pos_data || !ectx->type_data) goto failure;
+
     ectx->backend = ggml_backend_cpu_init();
     if (!ectx->backend) goto failure;
-    ggml_backend_cpu_set_n_threads(ectx->backend, 1);
+    ectx->n_threads = kc_emb_cpu_count();
+    ggml_backend_cpu_set_n_threads(ectx->backend, ectx->n_threads);
 
     ectx->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ectx->backend));
     if (!ectx->galloc) goto failure;
@@ -550,9 +604,6 @@ static void wordpiece_tokenize(
  * @return KC_EMB_OK on success, KC_EMB_ERROR on failure.
  */
 static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
-    int *tokens = NULL;
-    int *pos_data = NULL;
-    int *type_data = NULL;
     int n_tokens = 0;
     struct ggml_context *ctx0 = NULL;
     struct ggml_tensor *inp_tokens = NULL;
@@ -563,27 +614,26 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
     struct ggml_tensor *cls = NULL;
     int d_head = 0;
     const char *prefix = "Represent this sentence for retrieval: ";
-    char *norm_input = NULL;
     size_t norm_len = 0;
 
     if (!ectx || !input || !out) return KC_EMB_ERROR;
 
     norm_len = strlen(prefix) + strlen(input) + 1;
-    norm_input = (char *)malloc(norm_len);
-    if (!norm_input) return KC_EMB_ERROR;
-    snprintf(norm_input, norm_len, "%s%s", prefix, input);
+    if (norm_len > ectx->norm_input_size) {
+        char *next;
 
-    tokens    = (int *)calloc(ectx->n_ctx, sizeof(int));
-    pos_data  = (int *)calloc(ectx->n_ctx, sizeof(int));
-    type_data = (int *)calloc(ectx->n_ctx, sizeof(int));
-    if (!tokens || !pos_data || !type_data) goto failure;
+        next = (char *)realloc(ectx->norm_input, norm_len);
+        if (!next) goto failure;
+        ectx->norm_input = next;
+        ectx->norm_input_size = norm_len;
+    }
+    snprintf(ectx->norm_input, ectx->norm_input_size, "%s%s", prefix, input);
 
-    wordpiece_tokenize(ectx, norm_input, tokens, &n_tokens);
-    free(norm_input); norm_input = NULL;
+    wordpiece_tokenize(ectx, ectx->norm_input, ectx->tokens, &n_tokens);
 
     if (n_tokens < 2 || n_tokens > ectx->n_ctx) goto failure;
 
-    for (int i = 0; i < n_tokens; i++) pos_data[i] = i;
+    for (int i = 0; i < n_tokens; i++) ectx->pos_data[i] = i;
 
     {
         struct ggml_init_params params;
@@ -599,9 +649,9 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
     inp_type   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     if (!inp_tokens || !inp_pos || !inp_type) goto failure;
 
-    inp_tokens->data = tokens;
-    inp_pos->data    = pos_data;
-    inp_type->data   = type_data;
+    inp_tokens->data = ectx->tokens;
+    inp_pos->data    = ectx->pos_data;
+    inp_type->data   = ectx->type_data;
 
     gf = ggml_new_graph(ctx0);
     if (!gf) goto failure;
@@ -664,8 +714,8 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
 
     if (!ggml_gallocr_alloc_graph(ectx->galloc, gf)) goto failure;
 
-    memcpy(inp_tokens->data, tokens,    n_tokens * sizeof(int));
-    memcpy(inp_pos->data,    pos_data,  n_tokens * sizeof(int));
+    memcpy(inp_tokens->data, ectx->tokens, n_tokens * sizeof(int));
+    memcpy(inp_pos->data, ectx->pos_data, n_tokens * sizeof(int));
     memset(inp_type->data,   0,         n_tokens * sizeof(int));
 
     ggml_backend_graph_compute(ectx->backend, gf);
@@ -675,17 +725,10 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
     memcpy(out, cls->data, ectx->n_embd * sizeof(float));
 
     ggml_free(ctx0);
-    free(tokens);
-    free(pos_data);
-    free(type_data);
     return KC_EMB_OK;
 
 failure:
-    if (ctx0)      ggml_free(ctx0);
-    if (tokens)    free(tokens);
-    if (pos_data)  free(pos_data);
-    if (type_data) free(type_data);
-    if (norm_input) free(norm_input);
+    if (ctx0) ggml_free(ctx0);
     return KC_EMB_ERROR;
 }
 
@@ -825,14 +868,7 @@ static void kc_emb_worker_destroy(kc_emb_worker_t *w) {
 kc_emb_t *kc_emb_open(void) {
     int n_workers;
 
-#ifdef _WIN32
-    SYSTEM_INFO sysinfo;
-    GetSystemInfo(&sysinfo);
-    n_workers = sysinfo.dwNumberOfProcessors == 0 ? 1 : (int)sysinfo.dwNumberOfProcessors;
-#else
-    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    n_workers = nproc <= 0 ? 1 : (int)nproc;
-#endif
+    n_workers = 1;
 
     kc_emb_t *ctx = (kc_emb_t *)calloc(1, sizeof(kc_emb_t));
     if (!ctx) return NULL;

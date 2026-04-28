@@ -76,9 +76,13 @@ Replace `lib/model.gguf` with any GGUF BERT-compatible model and rebuild.
 
 ## Lifecycle
 
-- `kc_emb_open()` — allocates and returns a pool owned by the caller. Spawns one worker thread per available CPU. Each worker holds an independent GGML inference context backed by the embedded model binary (shared read-only memory).
-- `kc_emb_close()` — shuts down all workers and releases all resources. Must not be called while `kc_emb_exec()` is active on any thread.
-- `kc_emb_exec()` — dispatches to the next free worker and blocks until the result is ready. Multiple threads may call this concurrently on the same context.
+- `kc_emb_open()` — allocates and returns a context owned by the caller. It
+    prepares one GGML inference context backed by the embedded model binary.
+- `kc_emb_close()` — shuts down the worker and releases all resources. Must
+    not be called while `kc_emb_exec()` is active on any thread.
+- `kc_emb_exec()` — dispatches to the prepared worker and blocks until the
+    result is ready. Each request uses a bounded CPU thread set. Multiple
+    callers on the same context are serialized.
 
 ---
 
