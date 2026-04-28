@@ -159,7 +159,6 @@ static int kc_isspace(int c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
 }
 
-
 /**
  * Convert an ASCII character to lowercase.
  * @param c Input character.
@@ -415,7 +414,6 @@ static kc_emb_ctx_t *kc_emb_ctx_open(void) {
         kid = gguf_find_key(ectx->gguf, "bert.attention.layer_norm_epsilon");
         ectx->layer_norm_eps = (kid >= 0) ? gguf_get_val_f32(ectx->gguf, kid) : 1e-12f;
 
-
         kid = gguf_find_key(ectx->gguf, "tokenizer.ggml.tokens");
         if (kid < 0) goto failure;
 
@@ -549,7 +547,6 @@ static void wordpiece_tokenize(kc_emb_ctx_t *ectx, const char *input, int *token
                 size_t blen = 0;
                 int found = 0;
 
-                // 1. Try with space prefix (BPE-style)
                 if (start == 0) {
                     memcpy(buf, space_prefix, 3);
                     blen = 3;
@@ -565,7 +562,6 @@ static void wordpiece_tokenize(kc_emb_ctx_t *ectx, const char *input, int *token
                     }
                 }
 
-                // 2. Try with WordPiece subword prefix
                 if (!found && start > 0) {
                     memcpy(buf, "##", 2);
                     blen = 2;
@@ -581,7 +577,6 @@ static void wordpiece_tokenize(kc_emb_ctx_t *ectx, const char *input, int *token
                     }
                 }
 
-                // 3. Try without prefix
                 if (!found) {
                     blen = 0;
                     if (blen + (end - start) < sizeof(buf)) {
@@ -727,7 +722,6 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
 
     if (cur->ne[0] != ectx->n_embd) goto failure;
 
-    // CLS pooling
     res = ggml_view_2d(ctx0, cur, ectx->n_embd, 1, cur->nb[1], 0);
     res = ggml_cont(ctx0, res);
     ggml_build_forward_expand(gf, res);
