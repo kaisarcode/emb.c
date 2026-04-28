@@ -210,7 +210,7 @@ endif()
 set(LIB_SOURCES src/libemb.c ${GGML_SOURCES})
 
 add_library(emb_static STATIC ${LIB_SOURCES} ${MODEL_EMBED_SOURCES})
-set_target_properties(emb_static PROPERTIES OUTPUT_NAME "emb")
+set_target_properties(emb_static PROPERTIES OUTPUT_NAME "emb" POSITION_INDEPENDENT_CODE ON)
 target_include_directories(emb_static PRIVATE src lib/ggml/include lib/ggml/src lib/ggml/src/ggml-cpu)
 
 if(UNIX AND NOT ANDROID)
