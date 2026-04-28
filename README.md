@@ -81,7 +81,7 @@ Replace `lib/model.gguf` with any GGUF BERT-compatible model and rebuild.
 - `kc_emb_close()` — shuts down the worker and releases all resources. Must
     not be called while `kc_emb_exec()` is active on any thread.
 - `kc_emb_exec()` — dispatches to the prepared worker and blocks until the
-    result is ready. Each request uses a bounded CPU thread set. Multiple
+    result is ready. Each request uses up to four CPU threads. Multiple
     callers on the same context are serialized.
 
 ---
