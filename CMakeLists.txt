@@ -155,7 +155,11 @@ else()
     else()
         get_filename_component(COMPILER_DIR  "${CMAKE_C_COMPILER}" DIRECTORY)
         get_filename_component(COMPILER_NAME "${CMAKE_C_COMPILER}" NAME_WE)
-        string(REPLACE "gcc" "objcopy" OBJCOPY_NAME "${COMPILER_NAME}")
+        if("${COMPILER_NAME}" STREQUAL "cc")
+            set(OBJCOPY_NAME "objcopy")
+        else()
+            string(REPLACE "gcc" "objcopy" OBJCOPY_NAME "${COMPILER_NAME}")
+        endif()
         find_program(OBJCOPY_CMD
             NAMES "${OBJCOPY_NAME}" objcopy
             HINTS "${COMPILER_DIR}"

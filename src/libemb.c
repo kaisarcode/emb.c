@@ -547,37 +547,56 @@ static void wordpiece_tokenize(kc_emb_ctx_t *ectx, const char *input, int *token
             for (size_t end = word_len; end > start; end--) {
                 char buf[128];
                 size_t blen = 0;
+                int found = 0;
 
-                // For BGE BPE, the first token of a word often has a space prefix in vocab
+                // 1. Try with space prefix (BPE-style)
                 if (start == 0) {
                     memcpy(buf, space_prefix, 3);
                     blen = 3;
-                }
-
-                if (blen + (end - start) < sizeof(buf)) {
-                    for (size_t k = start; k < end; k++) {
-                        buf[blen++] = (char)kc_tolower((uint8_t)input[word_start + k]);
-                    }
-                    buf[blen] = '\0';
-
-                    int id = find_token(ectx, buf);
-                    if (id >= 0) {
-                        best_id = id;
-                        best_len = end - start;
-                        break;
+                    if (blen + (end - start) < sizeof(buf)) {
+                        for (size_t k = start; k < end; k++) {
+                            buf[blen++] = (char)kc_tolower((uint8_t)input[word_start + k]);
+                        }
+                        buf[blen] = '\0';
+                        best_id = find_token(ectx, buf);
+                        if (best_id >= 0) {
+                            found = 1;
+                        }
                     }
                 }
 
-                // If no match with prefix, try without prefix
-                blen = 0;
-                for (size_t k = start; k < end; k++) {
-                    buf[blen++] = (char)kc_tolower((uint8_t)input[word_start + k]);
+                // 2. Try with WordPiece subword prefix
+                if (!found && start > 0) {
+                    memcpy(buf, "##", 2);
+                    blen = 2;
+                    if (blen + (end - start) < sizeof(buf)) {
+                        for (size_t k = start; k < end; k++) {
+                            buf[blen++] = (char)kc_tolower((uint8_t)input[word_start + k]);
+                        }
+                        buf[blen] = '\0';
+                        best_id = find_token(ectx, buf);
+                        if (best_id >= 0) {
+                            found = 1;
+                        }
+                    }
                 }
-                buf[blen] = '\0';
-                
-                int id = find_token(ectx, buf);
-                if (id >= 0) {
-                    best_id = id;
+
+                // 3. Try without prefix
+                if (!found) {
+                    blen = 0;
+                    if (blen + (end - start) < sizeof(buf)) {
+                        for (size_t k = start; k < end; k++) {
+                            buf[blen++] = (char)kc_tolower((uint8_t)input[word_start + k]);
+                        }
+                        buf[blen] = '\0';
+                        best_id = find_token(ectx, buf);
+                        if (best_id >= 0) {
+                            found = 1;
+                        }
+                    }
+                }
+
+                if (found) {
                     best_len = end - start;
                     break;
                 }
@@ -597,6 +616,24 @@ static void wordpiece_tokenize(kc_emb_ctx_t *ectx, const char *input, int *token
 }
 
 /**
+ * Perform proper LayerNorm: (x - mean) / std * weight + bias.
+ * @param ctx GGML context.
+ * @param a   Input tensor.
+ * @param w   Weight tensor.
+ * @param b   Bias tensor.
+ * @param eps Epsilon for numerical stability.
+ * @return Normalized tensor.
+ */
+static struct ggml_tensor * kc_ggml_layer_norm(struct ggml_context * ctx,
+struct ggml_tensor * a, struct ggml_tensor * w, struct ggml_tensor * b,
+float eps) {
+    struct ggml_tensor * mean = ggml_mean(ctx, a);
+    struct ggml_tensor * sub  = ggml_sub(ctx, a, mean);
+    struct ggml_tensor * norm = ggml_norm(ctx, sub, eps);
+    return ggml_add(ctx, ggml_mul(ctx, norm, w), b);
+}
+
+/**
  * Run inference on one worker context and write the result to out.
  * @param ectx Worker context pointer.
  * @param input Input text.
@@ -611,7 +648,7 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
     struct ggml_tensor *inp_type = NULL;
     struct ggml_cgraph *gf = NULL;
     struct ggml_tensor *cur = NULL;
-    struct ggml_tensor *cls = NULL;
+    struct ggml_tensor *res = NULL;
     int d_head = 0;
     wordpiece_tokenize(ectx, input, ectx->tokens, &n_tokens);
 
@@ -648,8 +685,7 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
         cur = ggml_add(ctx0, cur, pos);
         cur = ggml_add(ctx0, cur, typ);
     }
-    cur = ggml_norm(ctx0, cur, ectx->layer_norm_eps);
-    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ectx->token_embd_norm_w), ectx->token_embd_norm_b);
+    cur = kc_ggml_layer_norm(ctx0, cur, ectx->token_embd_norm_w, ectx->token_embd_norm_b, ectx->layer_norm_eps);
 
     d_head = ectx->n_embd / ectx->n_head;
 
@@ -678,8 +714,7 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
 
         struct ggml_tensor *attn_out = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].attn_out_w, kqv), ectx->layers[il].attn_out_b);
         cur = ggml_add(ctx0, inp_L, attn_out);
-        cur = ggml_norm(ctx0, cur, ectx->layer_norm_eps);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ectx->layers[il].attn_norm_w), ectx->layers[il].attn_norm_b);
+        cur = kc_ggml_layer_norm(ctx0, cur, ectx->layers[il].attn_norm_w, ectx->layers[il].attn_norm_b, ectx->layer_norm_eps);
 
         struct ggml_tensor *inp_F = cur;
         struct ggml_tensor *ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].ffn_up_w, cur), ectx->layers[il].ffn_up_b);
@@ -687,15 +722,15 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
         ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].ffn_down_w, ffn), ectx->layers[il].ffn_down_b);
 
         cur = ggml_add(ctx0, inp_F, ffn);
-        cur = ggml_norm(ctx0, cur, ectx->layer_norm_eps);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, ectx->layers[il].layer_norm_w), ectx->layers[il].layer_norm_b);
+        cur = kc_ggml_layer_norm(ctx0, cur, ectx->layers[il].layer_norm_w, ectx->layers[il].layer_norm_b, ectx->layer_norm_eps);
     }
 
     if (cur->ne[0] != ectx->n_embd) goto failure;
 
-    cls = ggml_view_2d(ctx0, cur, ectx->n_embd, 1, cur->nb[1], 0);
-    cls = ggml_cont(ctx0, cls);
-    ggml_build_forward_expand(gf, cls);
+    // CLS pooling
+    res = ggml_view_2d(ctx0, cur, ectx->n_embd, 1, cur->nb[1], 0);
+    res = ggml_cont(ctx0, res);
+    ggml_build_forward_expand(gf, res);
 
     if (!ggml_gallocr_alloc_graph(ectx->galloc, gf)) goto failure;
 
@@ -705,9 +740,19 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
 
     ggml_backend_graph_compute(ectx->backend, gf);
 
-    if (!cls->data || cls->ne[0] != ectx->n_embd) goto failure;
+    if (!res->data || res->ne[0] != ectx->n_embd) goto failure;
 
-    memcpy(out, cls->data, ectx->n_embd * sizeof(float));
+    {
+        float *p = (float *)res->data;
+        double sum = 0;
+        for (int i = 0; i < ectx->n_embd; i++) sum += (double)p[i] * p[i];
+        float norm = (float)sqrt(sum);
+        if (norm > 1e-12f) {
+            for (int i = 0; i < ectx->n_embd; i++) p[i] /= norm;
+        }
+    }
+
+    memcpy(out, res->data, ectx->n_embd * sizeof(float));
 
     ggml_free(ctx0);
     return KC_EMB_OK;
