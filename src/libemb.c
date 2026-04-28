@@ -159,14 +159,6 @@ static int kc_isspace(int c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
 }
 
-/**
- * Check if a character is ASCII punctuation.
- * @param c Input character.
- * @return 1 if punctuation, 0 otherwise.
- */
-static int kc_ispunct(int c) {
-    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
-}
 
 /**
  * Convert an ASCII character to lowercase.
@@ -423,6 +415,7 @@ static kc_emb_ctx_t *kc_emb_ctx_open(void) {
         kid = gguf_find_key(ectx->gguf, "bert.attention.layer_norm_epsilon");
         ectx->layer_norm_eps = (kid >= 0) ? gguf_get_val_f32(ectx->gguf, kid) : 1e-12f;
 
+
         kid = gguf_find_key(ectx->gguf, "tokenizer.ggml.tokens");
         if (kid < 0) goto failure;
 
@@ -434,6 +427,8 @@ static kc_emb_ctx_t *kc_emb_ctx_open(void) {
 
         for (int i = 0; i < ectx->n_vocab; i++) {
             ectx->vocab[i] = (char *)gguf_get_arr_str(ectx->gguf, kid, i);
+            if (i < 0) {
+            }
         }
 
         if (build_vocab_hash(ectx) != 0) {
@@ -526,71 +521,76 @@ failure:
  * @param n_tokens Output token count.
  * @return No return value.
  */
-static void wordpiece_tokenize(
-    kc_emb_ctx_t *ectx,
-    const char *input,
-    int *tokens,
-    int *n_tokens
-) {
+static void wordpiece_tokenize(kc_emb_ctx_t *ectx, const char *input, int *tokens, int *n_tokens) {
+    size_t i = 0;
+    size_t len = strlen(input);
+    const char *space_prefix = "\xe2\x96\x81";
+
     *n_tokens = 0;
     if (*n_tokens < ectx->n_ctx) {
         tokens[(*n_tokens)++] = ectx->cls_token_id;
     }
 
-    int len = strlen(input);
-    int i = 0;
-
     while (i < len && *n_tokens < ectx->n_ctx - 1) {
         while (i < len && kc_isspace((uint8_t)input[i])) i++;
-        if (i >= len) break;
+        if (i == len) break;
 
-        if (kc_ispunct((uint8_t)input[i])) {
-            char p[2] = { (char)kc_tolower((uint8_t)input[i]), '\0' };
-            int id = find_token(ectx, p);
-            if (*n_tokens < ectx->n_ctx) {
-                tokens[(*n_tokens)++] = id >= 0 ? id : ectx->unk_token_id;
-            }
-            i++;
-            continue;
-        }
+        size_t word_start = i;
+        while (i < len && !kc_isspace((uint8_t)input[i])) i++;
+        size_t word_len = i - word_start;
 
-        int j = i;
-        while (j < len && !kc_isspace((uint8_t)input[j]) && !kc_ispunct((uint8_t)input[j])) j++;
-
-        int word_len = j - i;
-        char word[128];
-        if (word_len >= (int)sizeof(word)) word_len = sizeof(word) - 1;
-        for (int k = 0; k < word_len; k++) word[k] = (char)kc_tolower((uint8_t)input[i + k]);
-        word[word_len] = '\0';
-
-        int start = 0;
+        size_t start = 0;
         while (start < word_len && *n_tokens < ectx->n_ctx - 1) {
-            int end = word_len;
             int best_id = -1;
-            int best_end = -1;
+            size_t best_len = 0;
 
-            while (end > start) {
-                char subword[128];
-                int slen = 0;
-                if (start > 0) { subword[0] = '#'; subword[1] = '#'; slen = 2; }
-                for (int k = start; k < end; k++) {
-                    if (slen >= (int)sizeof(subword) - 1) break;
-                    subword[slen++] = word[k];
+            for (size_t end = word_len; end > start; end--) {
+                char buf[128];
+                size_t blen = 0;
+
+                // For BGE BPE, the first token of a word often has a space prefix in vocab
+                if (start == 0) {
+                    memcpy(buf, space_prefix, 3);
+                    blen = 3;
                 }
-                subword[slen] = '\0';
-                int id = find_token(ectx, subword);
-                if (id >= 0) { best_id = id; best_end = end; break; }
-                end--;
+
+                if (blen + (end - start) < sizeof(buf)) {
+                    for (size_t k = start; k < end; k++) {
+                        buf[blen++] = (char)kc_tolower((uint8_t)input[word_start + k]);
+                    }
+                    buf[blen] = '\0';
+
+                    int id = find_token(ectx, buf);
+                    if (id >= 0) {
+                        best_id = id;
+                        best_len = end - start;
+                        break;
+                    }
+                }
+
+                // If no match with prefix, try without prefix
+                blen = 0;
+                for (size_t k = start; k < end; k++) {
+                    buf[blen++] = (char)kc_tolower((uint8_t)input[word_start + k]);
+                }
+                buf[blen] = '\0';
+                
+                int id = find_token(ectx, buf);
+                if (id >= 0) {
+                    best_id = id;
+                    best_len = end - start;
+                    break;
+                }
             }
 
-            if (best_id == -1) {
+            if (best_id != -1) {
+                tokens[(*n_tokens)++] = best_id;
+                start += best_len;
+            } else {
                 if (*n_tokens < ectx->n_ctx) tokens[(*n_tokens)++] = ectx->unk_token_id;
-                break;
+                start++; 
             }
-            if (*n_tokens < ectx->n_ctx) tokens[(*n_tokens)++] = best_id;
-            start = best_end;
         }
-        i = j;
     }
 
     if (*n_tokens < ectx->n_ctx) tokens[(*n_tokens)++] = ectx->sep_token_id;
@@ -613,23 +613,7 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
     struct ggml_tensor *cur = NULL;
     struct ggml_tensor *cls = NULL;
     int d_head = 0;
-    const char *prefix = "Represent this sentence for retrieval: ";
-    size_t norm_len = 0;
-
-    if (!ectx || !input || !out) return KC_EMB_ERROR;
-
-    norm_len = strlen(prefix) + strlen(input) + 1;
-    if (norm_len > ectx->norm_input_size) {
-        char *next;
-
-        next = (char *)realloc(ectx->norm_input, norm_len);
-        if (!next) goto failure;
-        ectx->norm_input = next;
-        ectx->norm_input_size = norm_len;
-    }
-    snprintf(ectx->norm_input, ectx->norm_input_size, "%s%s", prefix, input);
-
-    wordpiece_tokenize(ectx, ectx->norm_input, ectx->tokens, &n_tokens);
+    wordpiece_tokenize(ectx, input, ectx->tokens, &n_tokens);
 
     if (n_tokens < 2 || n_tokens > ectx->n_ctx) goto failure;
 
@@ -676,18 +660,19 @@ static int kc_emb_ctx_exec(kc_emb_ctx_t *ectx, const char *input, float *out) {
         struct ggml_tensor *v = ggml_add(ctx0, ggml_mul_mat(ctx0, ectx->layers[il].attn_v_w, cur), ectx->layers[il].attn_v_b);
 
         q = ggml_reshape_3d(ctx0, q, d_head, ectx->n_head, n_tokens);
-        k = ggml_reshape_3d(ctx0, k, d_head, ectx->n_head, n_tokens);
-        v = ggml_reshape_3d(ctx0, v, d_head, ectx->n_head, n_tokens);
-
         q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
-        k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
-        v = ggml_cont(ctx0, ggml_permute(ctx0, v, 1, 2, 0, 3));
 
-        struct ggml_tensor *kq = ggml_mul_mat(ctx0, q, k);
+        k = ggml_reshape_3d(ctx0, k, d_head, ectx->n_head, n_tokens);
+        k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
+
+        struct ggml_tensor *kq = ggml_mul_mat(ctx0, k, q);
         kq = ggml_scale_inplace(ctx0, kq, 1.0f / sqrtf((float)d_head));
         kq = ggml_soft_max_inplace(ctx0, kq);
 
-        struct ggml_tensor *kqv = ggml_mul_mat(ctx0, v, kq);
+        v = ggml_reshape_3d(ctx0, v, d_head, ectx->n_head, n_tokens);
+        v = ggml_cont(ctx0, ggml_permute(ctx0, v, 0, 2, 1, 3));
+
+        struct ggml_tensor * kqv = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, v)), kq);
         kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
         kqv = ggml_reshape_2d(ctx0, kqv, ectx->n_embd, n_tokens);
 
