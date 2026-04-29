@@ -55,8 +55,17 @@ make clean
 
 Each target produces under `bin/{arch}/{platform}/`:
 - `libemb.a` — static library
-- `libemb.so` / `libemb.dll` — shared library
+- `libemb.so` / `libemb.dll` / `libemb.dll.a` — shared library and import lib
 - `emb` / `emb.exe` — CLI executable
+
+## CLI
+
+```bash
+./bin/x86_64/linux/emb "The cat is green"
+./bin/x86_64/linux/emb < input.txt
+```
+
+The CLI outputs the vector embedding as a single line of space-separated floating point numbers to stdout. Errors are written to stderr.
 
 ## Usage
 
