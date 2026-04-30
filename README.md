@@ -62,13 +62,13 @@ Each target produces under `bin/{arch}/{platform}/`:
 
 ```bash
 # Single input via arguments
-./bin/x86_64/linux/emb "The cat is green"
+emb "The cat is green"
 
 # Multiple inputs via stdin (one embedding per line)
-cat sentences.txt | ./bin/x86_64/linux/emb
+cat sentences.txt | emb
 
-# Redirected input
-./bin/x86_64/linux/emb < input.txt
+# Redirected input (one embedding per line)
+emb < input.txt
 ```
 
 The CLI processes input from arguments or `stdin`. When using arguments, they are joined into a single input string. When using `stdin` (piped or redirected), the tool processes input line-by-line, outputting one vector per line. This is the most efficient way to process multiple strings as the model is only loaded once.
