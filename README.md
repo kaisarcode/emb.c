@@ -105,7 +105,7 @@ Replace `lib/model.gguf` with any GGUF BERT-compatible model and rebuild.
 
 **Author:** KaisarCode
 
-**Email:** <kaisarcode@gmail.com>
+**Email:** <kaisar@kaisarcode.com>
 
 **Website:** [https://kaisarcode.com](https://kaisarcode.com)
 
