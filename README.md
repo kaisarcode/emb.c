@@ -61,11 +61,19 @@ Each target produces under `bin/{arch}/{platform}/`:
 ## CLI
 
 ```bash
+# Single input via arguments
 ./bin/x86_64/linux/emb "The cat is green"
+
+# Multiple inputs via stdin (one embedding per line)
+cat sentences.txt | ./bin/x86_64/linux/emb
+
+# Redirected input
 ./bin/x86_64/linux/emb < input.txt
 ```
 
-The CLI outputs the vector embedding as a single line of space-separated floating point numbers to stdout. Errors are written to stderr.
+The CLI processes input from arguments or `stdin`. When using arguments, they are joined into a single input string. When using `stdin` (piped or redirected), the tool processes input line-by-line, outputting one vector per line. This is the most efficient way to process multiple strings as the model is only loaded once.
+
+The CLI outputs each vector embedding as a single line of space-separated floating point numbers to stdout. Errors are written to stderr.
 
 ## Usage
 
