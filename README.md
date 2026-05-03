@@ -71,6 +71,7 @@ kc_emb_close(ctx);
 ## Build
 
 ```bash
+make
 make all
 make x86_64/linux
 make x86_64/windows
