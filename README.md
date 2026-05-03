@@ -1,6 +1,6 @@
 # emb.c - Vector Embedding Library
 
-`emb.c` is a portable C library and CLI for generating vector embeddings from text using a GGML-based model. It is designed as a composable primitive for the KaisarCode ecosystem.
+`emb.c` is a portable C library and CLI for generating vector embeddings from text using a GGML-based model. It is designed as a composable primitive.
 
 ---
 
