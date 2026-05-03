@@ -30,6 +30,7 @@ cat sentences.txt | ./bin/x86_64/linux/emb
 | Flag | Description |
 | :--- | :--- |
 | `-h`, `--help` | Show help and usage |
+| `-v`, `--version` | Show version |
 
 ---
 

@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define KC_EMB_VERSION "0.1.0"
+
 #ifndef _WIN32
 #include <unistd.h>
 #else
@@ -35,6 +37,15 @@ static void kc_print_help(const char *name) {
     printf("\n");
     printf("Options:\n");
     printf("    -h, --help          Show this help message\n");
+    printf("    -v, --version       Show version\n");
+}
+
+/**
+ * Print command version information.
+ * @return None.
+ */
+static void kc_print_version(void) {
+    printf("emb %s\n", KC_EMB_VERSION);
 }
 
 /**
@@ -129,9 +140,15 @@ int main(int argc, char **argv) {
     float *vec = NULL;
     int dim = 0;
 
-    if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
-        kc_print_help(argv[0]);
-        return 0;
+    if (argc >= 2) {
+        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+            kc_print_help(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
+            kc_print_version();
+            return 0;
+        }
     }
 
     ctx = kc_emb_open();
